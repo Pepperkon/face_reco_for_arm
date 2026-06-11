@@ -15,12 +15,9 @@ def extract_weights(onnx_path, bin_path):
 
         weights_dict[name] = data
 
-    print(f"\n[*] Zapisywanie do pliku binarnego: {bin_path}")
     with open(bin_path, 'wb') as f:
         for name, data in weights_dict.items():
             f.write(data)
-
-    print(f"[+] Zakończono! Wagi gotowe dla C++: {bin_path}")
 
 
 if __name__ == '__main__':
