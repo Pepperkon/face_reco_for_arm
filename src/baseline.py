@@ -7,35 +7,43 @@ SFACE_MODEL = "../models/face_recognition_sface_2021dec.onnx"
 
 THRESHOLD = 0.363
 
-def InitModel():
-    detector=cv2.FaceDetectorYN.create(YUNET_MODEL,"",(320,320),0.7)
-    recognizer=cv2.FaceRecognizerSF.create(SFACE_MODEL,"")
-    return detector,recognizer
 
-def download_vector(image_path,detector,recognizer):
+def InitModel():
+    detector = cv2.FaceDetectorYN.create(YUNET_MODEL, "", (320, 320), 0.8)
+    recognizer = cv2.FaceRecognizerSF.create(SFACE_MODEL, "")
+    return detector, recognizer
+
+
+def download_vector(image_path, detector, recognizer):
     'it returns 128 dimension face vector or none if there is no face...'
     if not os.path.exists(image_path):
         print("ERROR - WRONG IMAGE PATH")
         return None
 
+
     img = cv2.imread(image_path)
     if img is None:
-        print ("ERROR - CANNOT OPEN IMAGE")
+        print("ERROR - CANNOT OPEN IMAGE")
         return None
+    'resize big photo, yunet sometimes canoot handle big faces'
+    MAX_SIZE = 640
+    height, width, _ = img.shape
+    if max(height, width) > MAX_SIZE:
+        scale = MAX_SIZE / max(height, width)
+        img = cv2.resize(img, (int(width * scale), int(height * scale)))
 
     'set tensor size to img shape'
-    height,width, _ = img.shape
-    detector.setInputSize((width,height))
+    height, width, _ = img.shape
+    detector.setInputSize((width, height))
 
-
-    status,faces = detector.detect(img)
-    if faces is None or len(faces)==0:
+    status, faces = detector.detect(img)
+    if faces is None or len(faces) == 0:
         print('No faces on this image :(((')
         return None
 
     detectedFaces = []
     for face in faces:
-        aligned_face = recognizer.alignCrop(img,face)
+        aligned_face = recognizer.alignCrop(img, face)
         faceVector = recognizer.feature(aligned_face)
         detectedFaces.append(faceVector)
     return detectedFaces
