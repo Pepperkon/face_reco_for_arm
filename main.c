@@ -16,7 +16,7 @@ void *allocate_aligned(size_t alignment, size_t size) {
     return _aligned_malloc(size, alignment);
 #else
     void *ptr = NULL;
-    res = posix_memalign(&ptr, alignment, size);
+    uint32_t res = posix_memalign(&ptr, alignment, size);
     if (res != 0) {
         fprintf(stderr, "ERROR: posix_memalign returned code %d\n", res);
         return NULL;
@@ -117,7 +117,7 @@ Tensor create_Tensor(const uint32_t n, const uint32_t c, const uint32_t h, const
     return t;
 }
 
-void free_tensor(Tensor* t) {
+void free_tensor(Tensor *t) {
     if (t->data != NULL) {
         free_alligned(t->data);
         t->data = NULL;
@@ -164,65 +164,100 @@ void reshape(Tensor *t, const uint32_t new_n, const uint32_t new_c, const uint32
     t->height = new_h;
     t->width = new_w;
 }
+
 // ===============================
 
 // ========> ADD <================
-void add_tensors(const Tensor *t_1, const Tensor *t_2) {
+void add_tensors(Tensor *t_1, const Tensor *t_2) {
     if (t_1->channel != t_2->channel || t_1->height != t_2->height || t_1->width != t_2->width) {
         fprintf(stderr, "CRITICAL ERROR: Tensors must have the same size to add them!\n");
         exit(1);
     }
-    const size_t total_t1 = (size_t)t_1->channel * t_1->batch * t_1->height * t_1->width;
-    for (size_t i = 0; i<total_t1; ++i) {
-        t_1->data[i]+=t_2->data[i];
+    const size_t total_t1 = (size_t) t_1->channel * t_1->batch * t_1->height * t_1->width;
+    for (size_t i = 0; i < total_t1; ++i) {
+        t_1->data[i] += t_2->data[i];
     }
 }
+
 // ===============================
 
 // =======> TRANSPOSE <===========
 // change from nhwc to nchw
 Tensor transpose(const Tensor *t) {
-    const Tensor res = create_Tensor(t->batch, t->height, t->channel, t->width);
-    for (uint32_t b = 0; b<t->batch; ++b) {
-        for (uint32_t c = 0; c< t->channel; ++c) {
-            for (uint32_t h = 0; h<t->height; ++h) {
-                for (uint32_t w = 0; w<t->width; ++w) {
-                    size_t orginial_indx = get_index_of_pixel(t,b,c,h,w);
-                    size_t after_indx = b*(t->height*t->channel*t->width) + h*(t->channel*t->width) +
-                        w* t->channel + c;
+    //                              n           c           h               w
+    Tensor res = create_Tensor(t->batch, t->height, t->width, t->channel);
+    for (uint32_t b = 0; b < t->batch; ++b) {
+        for (uint32_t c = 0; c < t->channel; ++c) {
+            for (uint32_t h = 0; h < t->height; ++h) {
+                for (uint32_t w = 0; w < t->width; ++w) {
+                    size_t orginial_indx = get_index_of_pixel(t, b, c, h, w);
+                    size_t after_indx = (size_t) b * (t->height * t->channel * t->width) +
+                                        (size_t) h * (t->channel * t->width) +
+                                        (size_t) w * t->channel + c;
                     res.data[after_indx] = t->data[orginial_indx];
                 }
-
             }
         }
     }
     return res;
 }
+
 // ===============================
 
 // =======> MAXPOOL_2D <=============
 Tensor maxPool(const Tensor *t, uint32_t pool_size, uint32_t stride) {
     uint32_t new_h = (t->height - pool_size) / stride + 1;
     uint32_t new_w = (t->width - pool_size) / stride + 1;
-    Tensor res = create_Tensor(t->batch, t->channel, new_h, new_w );
+    Tensor res = create_Tensor(t->batch, t->channel, new_h, new_w);
     for (uint32_t b = 0; b < t->batch; ++b) {
         for (uint32_t c = 0; c < t->channel; ++c) {
-            for (uint32_t h=0; h<new_h; ++h) {
-                for (uint32_t w = 0; w<new_w; ++w) {
-
-                    uint32_t res_indx = get_index_of_pixel(&res,b,c,h,w);
+            for (uint32_t h = 0; h < new_h; ++h) {
+                for (uint32_t w = 0; w < new_w; ++w) {
+                    uint32_t res_indx = get_index_of_pixel(&res, b, c, h, w);
                     float max_val = -INFINITY;
-                    for (uint32_t i = 0; i <pool_size; ++i) {
+                    for (uint32_t i = 0; i < pool_size; ++i) {
                         for (uint32_t j = 0; j < pool_size; ++j) {
-                            uint32_t t_i = (h*stride)+i; //column
-                            uint32_t t_j = (w*stride)+j; //row
-                            uint32_t t_index = get_index_of_pixel(t,b,c,t_i, t_j);
-                            if (t->data[t_index]>max_val) {
-                                max_val=t->data[t_index];
+                            uint32_t t_i = (h * stride) + i; //column
+                            uint32_t t_j = (w * stride) + j; //row
+                            uint32_t t_index = get_index_of_pixel(t, b, c, t_i, t_j);
+                            if (t->data[t_index] > max_val) {
+                                max_val = t->data[t_index];
                             }
                         }
                     }
-                    res.data[res_indx]=max_val;
+                    res.data[res_indx] = max_val;
+                }
+            }
+        }
+    }
+    return res;
+}
+
+// ===============================
+
+// ==========> RESIZE <===========
+// yunet resize is asymmetric and algorithm is nearest neigbour with floor variant so first we make new tensor,
+// and for every pixel we do simple operation old_tensor_id = floor(new_tensor_index/ scale)
+// resize for channel and batches are left 1:1 hopefully...
+// ===============================
+Tensor resize_nn_asymmetric(const Tensor *t, const uint32_t new_width, const uint32_t new_height) {
+    Tensor res = create_Tensor(t->batch, t->channel, new_height, new_width);
+    float scale_x = (float) new_width / (float) t->width;
+    float scale_y = (float) new_height / (float) t->height;
+    for (uint32_t b = 0; b < t->batch; ++b) {
+        for (uint32_t c = 0; c < t->channel; ++c) {
+            for (uint32_t y = 0; y < new_height; ++y) {
+                for (uint32_t x = 0; x < new_width; ++x) {
+                    uint32_t old_y = (uint32_t) (y / scale_y);
+                    uint32_t old_x = (uint32_t) (x / scale_x);
+
+                    if (old_y >= t->height) old_y = t->height - 1;
+                    if (old_x >= t->width) old_x = t->width - 1;
+
+                    size_t new_tensor_index = get_index_of_pixel(&res, b, c, y, x);
+                    size_t old_tensor_index = get_index_of_pixel(t, b, c, old_y, old_x);
+
+                    res.data[new_tensor_index] = t->data[old_tensor_index];
                 }
             }
         }
@@ -231,12 +266,28 @@ Tensor maxPool(const Tensor *t, uint32_t pool_size, uint32_t stride) {
 }
 // ===============================
 
-// ==========> RESIZE <===========
+// ====> Batch Normalization <====
 // ===============================
 
+// ===========> PRLEU <===========
+// ===============================
+
+// =======> Flatten <=============
+// ===============================
+
+// =========> subtract <==========
+// ===============================
+
+// ========> multiply <===========
+// ===============================
 
 // ==========> CONV <=============
 // ===============================
+
+// =======> DepthWise Conv <======
+// ===============================
+
 int main() {
     Tensor data;
+    printf( "zupa");
 }
