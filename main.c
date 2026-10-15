@@ -267,6 +267,7 @@ Tensor resize_nn_asymmetric(const Tensor *t, const uint32_t new_width, const uin
 // ===============================
 
 // ====> Batch Normalization <====
+
 // ===============================
 
 // ===========> PRLEU <===========
