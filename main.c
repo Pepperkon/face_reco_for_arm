@@ -321,10 +321,8 @@ Tensor conv(const Tensor *input, const Tensor *filter_tensor, const Float_vector
                                 int32_t in_y = (y * stride) + ky - padding;
                                 int32_t in_x = (x * stride) + kx - padding;
                                 //check if it is not padding (zeros)
-                                if (in_x >= 0 && in_x < (int32_t) input->width && in_y >= 0 && in_y < (int32_t) input->
-                                    height) {
-                                    size_t input_indx_x = get_index_of_pixel(
-                                        input, b, ic, (uint32_t) in_y, (uint32_t) in_x);
+                                if (in_x >= 0 && in_x < (int32_t) input->width && in_y >= 0 && in_y < (int32_t) input->height) {
+                                    size_t input_indx_x = get_index_of_pixel(input, b, ic, (uint32_t) in_y, (uint32_t) in_x);
                                     size_t filter_tensor_x = get_index_of_pixel(filter_tensor, c, ic, ky, kx);
 
                                     sum += input->data[input_indx_x] * filter_tensor->data[filter_tensor_x];
@@ -408,6 +406,7 @@ Tensor depthwise_conv2D(const Tensor *input, const Tensor *filter_tensor, const 
 // ===============================
 
 
+
 // ===========> NEURAL NETWORK  <============
 typedef enum {
     LAYER_CONV,
@@ -421,18 +420,22 @@ typedef enum {
     LAYER_RELU
 } LayerType;
 
+//what .cfg file can have (for more check build_nn_graph.py)
 typedef struct {
     LayerType type;
 
-    //important for add
+    //indexes of input neurons
+    //in yunet only neuron ADD has 2 input neurons :3
     int32_t input1_idx;
     int32_t input2_idx;
 
-    //for conv layers
+    // kernels sizes
     uint32_t kernel_h;
     uint32_t kernel_w;
+
     uint32_t stride;
     uint32_t padding;
+    //optimization for conv - conv+relu simultaniusly
     bool apply_relu;
 
     // for Reshape / Resize
