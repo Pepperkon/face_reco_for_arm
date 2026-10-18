@@ -51,6 +51,7 @@ def generate_c_config(onnx_path, cfg_path):
     tensor_to_id = {model.graph.input[0].name: -1}
     current_layer_id = 0
 
+    graph_output_names = {out.name for out in model.graph.output}
     with open(cfg_path, 'w') as f:
         for node in model.graph.node:
             out_tensor = node.output[0]
@@ -78,7 +79,7 @@ def generate_c_config(onnx_path, cfg_path):
             in_str = ",".join(inputs) if inputs else "-1"
 
             attrs = {attr.name: attr for attr in node.attribute}
-
+            out_tag = f" out_name={out_tensor}" if out_tensor in graph_output_names else ""
             if op == "Conv":
                 group = attrs["group"].i if "group" in attrs else 1
                 stride = attrs["strides"].ints[0] if "strides" in attrs else 1
@@ -95,21 +96,21 @@ def generate_c_config(onnx_path, cfg_path):
                 layer_type = "DEPTHWISE" if group > 1 else "CONV"
 
                 f.write(
-                    f"{current_layer_id} {layer_type} inputs={in_str} stride={stride} pad={pad} relu={apply_relu} weights={weight_file} bias={bias_file} w_shape={w_shape_str} ref_count={ref_count}\n")
+                    f"{current_layer_id} {layer_type} inputs={in_str} stride={stride} pad={pad} relu={apply_relu} weights={weight_file} bias={bias_file} w_shape={w_shape_str} ref_count={ref_count}{out_tag}\n")
 
             elif op == "MaxPool":
                 stride = attrs["strides"].ints[0] if "strides" in attrs else 1
                 kernel = attrs["kernel_shape"].ints[0] if "kernel_shape" in attrs else 2
                 pad = attrs["pads"].ints[0] if "pads" in attrs else 0
                 f.write(
-                    f"{current_layer_id} MAXPOOL inputs={in_str} kernel={kernel} stride={stride} pad={pad} ref_count={ref_count}\n")
+                    f"{current_layer_id} MAXPOOL inputs={in_str} kernel={kernel} stride={stride} pad={pad} ref_count={ref_count}{out_tag}\n")
 
             elif op in ["Resize", "Reshape"]:
                 f.write(
-                    f"{current_layer_id} {op.upper()} inputs={in_str} out_shape={out_shape_str} ref_count={ref_count}\n")
+                    f"{current_layer_id} {op.upper()} inputs={in_str} out_shape={out_shape_str} ref_count={ref_count}{out_tag}\n")
 
             elif op in ["Add", "Transpose", "Sigmoid", "Relu"]:
-                f.write(f"{current_layer_id} {op.upper()} inputs={in_str} ref_count={ref_count}\n")
+                f.write(f"{current_layer_id} {op.upper()} inputs={in_str} ref_count={ref_count}{out_tag}\n")
 
             tensor_to_id[out_tensor] = current_layer_id
             current_layer_id += 1

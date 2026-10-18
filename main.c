@@ -129,55 +129,72 @@ void free_tensor(Tensor *t) {
 // ===============================
 
 // ===========> RELU <============
+// lets do this in place
 // max(0, x)
-void relu(const Tensor *t) {
+Tensor relu(Tensor *t) {
     const size_t total_elements = (size_t) t->batch * t->channel * t->height * t->width;
     for (size_t i = 0; i < total_elements; ++i) {
         if (t->data[i] < 0.0f) {
             t->data[i] = 0.0f;
         }
     }
+    Tensor res = *t;
+    t->data = NULL;
+    t->batch = t->channel = t->height = t->width = 0;
+    return res;
 }
 
 // ===============================
 
 // =========> SIGMOID <===========
 // 1 / (1 + e^(-x))
-void sigmoid(const Tensor *t) {
+Tensor sigmoid(Tensor *t) {
     const size_t total_elements = (size_t) t->batch * t->channel * t->height * t->width;
     for (size_t i = 0; i < total_elements; ++i) {
         t->data[i] = 1.0f / (1.0f + expf(-t->data[i]));
     }
+    Tensor res = *t;
+    t->data = NULL;
+    t->batch = t->channel = t->height = t->width = 0;
+    return res;
 }
 
 // ===============================
 
 // =========> RESHAPE <===========
-void reshape(Tensor *t, const uint32_t new_n, const uint32_t new_c, const uint32_t new_h, const uint32_t new_w) {
+Tensor reshape(Tensor *t, const uint32_t new_n, const uint32_t new_c, const uint32_t new_h, const uint32_t new_w) {
     const size_t total_elements = (size_t) t->batch * t->channel * t->height * t->width;
     const size_t new_total_elements = (size_t) new_n * new_c * new_h * new_w;
     if (new_total_elements != total_elements) {
         fprintf(stderr, "ERROR: Reshape dimensions do not match original size!\n");
         exit(1);
     }
-    t->batch = new_n;
-    t->channel = new_c;
-    t->height = new_h;
-    t->width = new_w;
+    Tensor res;
+    res.batch = new_n;
+    res.channel = new_c;
+    res.height = new_h;
+    res.width = new_w;
+    res.data = t->data;
+
+    t->data = NULL;
+    t->batch = t->channel = t->height = t->width = 0;
+    return res;
 }
 
 // ===============================
 
 // ========> ADD <================
-void add_tensors(Tensor *t_1, const Tensor *t_2) {
+Tensor add_tensors(Tensor *t_1, const Tensor *t_2) {
+    Tensor res = create_Tensor(t_1->batch, t_1->channel, t_1->height, t_1->width);
     if (t_1->channel != t_2->channel || t_1->height != t_2->height || t_1->width != t_2->width) {
         fprintf(stderr, "CRITICAL ERROR: Tensors must have the same size to add them!\n");
         exit(1);
     }
     const size_t total_t1 = (size_t) t_1->channel * t_1->batch * t_1->height * t_1->width;
     for (size_t i = 0; i < total_t1; ++i) {
-        t_1->data[i] += t_2->data[i];
+        res.data[i] = t_1->data[i] + t_2->data[i];
     }
+    return res;
 }
 
 // ===============================
@@ -321,8 +338,10 @@ Tensor conv(const Tensor *input, const Tensor *filter_tensor, const Float_vector
                                 int32_t in_y = (y * stride) + ky - padding;
                                 int32_t in_x = (x * stride) + kx - padding;
                                 //check if it is not padding (zeros)
-                                if (in_x >= 0 && in_x < (int32_t) input->width && in_y >= 0 && in_y < (int32_t) input->height) {
-                                    size_t input_indx_x = get_index_of_pixel(input, b, ic, (uint32_t) in_y, (uint32_t) in_x);
+                                if (in_x >= 0 && in_x < (int32_t) input->width && in_y >= 0 && in_y < (int32_t) input->
+                                    height) {
+                                    size_t input_indx_x = get_index_of_pixel(
+                                        input, b, ic, (uint32_t) in_y, (uint32_t) in_x);
                                     size_t filter_tensor_x = get_index_of_pixel(filter_tensor, c, ic, ky, kx);
 
                                     sum += input->data[input_indx_x] * filter_tensor->data[filter_tensor_x];
@@ -406,8 +425,8 @@ Tensor depthwise_conv2D(const Tensor *input, const Tensor *filter_tensor, const 
 // ===============================
 
 
-
 // ===========> NEURAL NETWORK  <============
+
 typedef enum {
     LAYER_CONV,
     LAYER_DEPTHWISE_CONV,
@@ -423,6 +442,7 @@ typedef enum {
 //what .cfg file can have (for more check build_nn_graph.py)
 typedef struct {
     LayerType type;
+    int32_t id;
 
     //indexes of input neurons
     //in yunet only neuron ADD has 2 input neurons :3
@@ -435,16 +455,20 @@ typedef struct {
 
     uint32_t stride;
     uint32_t padding;
-    //optimization for conv - conv+relu simultaniusly
+    //optimization for conv - conv+relu simultaneously
     bool apply_relu;
 
-    // for Reshape / Resize
-    uint32_t target_w;
-    uint32_t target_h;
+    // Dimensions for Reshape / Resize
+    uint32_t out_n, out_c, out_h, out_w;
+
 
     // weights for conv layers
     Tensor weights;
     Float_vector bias;
+
+    // Execution & Lifetime
+    int32_t ref_count;
+    char out_name[32]; // e.g. "cls_8", "bbox_16", or ""
 } Layer;
 
 typedef struct {
@@ -452,52 +476,313 @@ typedef struct {
     size_t num_layers;
 } Network;
 
-Tensor forward_network(Network *net, const Tensor *input) {
+typedef struct {
+    char name[32]; // "cls_8", "bbox_16",   "fc1"
+    Tensor tensor;
+} OutputTensor;
 
-    Tensor *outputs = (Tensor *)malloc(net->num_layers * sizeof(Tensor));
+typedef struct {
+    OutputTensor *outputs;
+    size_t count;
+} NetworkOutputs;
+
+Tensor *get_output(NetworkOutputs *outs, const char *name) {
+    for (size_t i = 0; i < outs->count; ++i) {
+        if (strcmp(outs->outputs[i].name, name) == 0) {
+            return &outs->outputs[i].tensor;
+        }
+    }
+    return NULL;
+}
+
+void free_network_outputs(NetworkOutputs *outs) {
+    for (size_t i = 0; i < outs->count; ++i) {
+        free_tensor(&outs->outputs[i].tensor);
+    }
+    if (outs->outputs != NULL) {
+        free(outs->outputs);
+        outs->outputs = NULL;
+    }
+    outs->count = 0;
+}
+void free_network(Network *net) {
+    for (size_t i = 0; i < net->num_layers; ++i) {
+        if (net->layers[i].type == LAYER_CONV || net->layers[i].type == LAYER_DEPTHWISE_CONV) {
+            free_tensor(&net->layers[i].weights);
+            vec_free(&net->layers[i].bias);
+        }
+    }
+    if (net->layers) {
+        free(net->layers);
+        net->layers = NULL;
+    }
+    net->num_layers = 0;
+}
+Tensor load_weights(const char *filepath, uint32_t n, uint32_t c, uint32_t h, uint32_t w) {
+    Tensor t = create_Tensor(n, c, h, w);
+    FILE *f = fopen(filepath, "rb");
+    if (!f) {
+        fprintf(stderr, "CRITICAL ERROR: Cannot open weight file %s\n", filepath);
+        exit(1);
+    }
+    size_t total_floats = (size_t) n * c * h * w;
+    size_t read_count = fread(t.data, sizeof(float), total_floats, f);
+    if (read_count != total_floats) {
+        fprintf(stderr, "ERROR: Expected %zu floats in %s, read %zu\n", total_floats, filepath, read_count);
+    }
+    fclose(f);
+    return t;
+}
+void load_bias(const char *filepath, Float_vector *vec, uint32_t size) {
+    vec_init(vec, size);
+    FILE *f = fopen(filepath, "rb");
+    if (!f) {
+        fprintf(stderr, "CRITICAL ERROR: Cannot open bias file %s\n", filepath);
+        exit(1);
+    }
+    size_t read_count = fread(vec->data, sizeof(float), size, f);
+    if (read_count != size) {
+        fprintf(stderr, "ERROR: Expected %u bias floats in %s, read %zu\n", size, filepath, read_count);
+    }
+    vec->size = size;
+    fclose(f);
+}
+
+Network load_network(const char *cfg_path, const char *weights_dir) {
+    FILE *f = fopen(cfg_path, "r");
+    char final_weights_dir[256];
+    strncpy(final_weights_dir, weights_dir, sizeof(final_weights_dir));
+
+    if (!f) {
+        char fallback_cfg[512];
+        snprintf(fallback_cfg, sizeof(fallback_cfg), "../%s", cfg_path);
+        f = fopen(fallback_cfg, "r");
+        if (f) {
+            snprintf(final_weights_dir, sizeof(final_weights_dir), "../%s", weights_dir);
+        }
+    }
+
+    if (!f) {
+        fprintf(stderr, "CRITICAL ERROR: Cannot open cfg file %s (also tried ../%s)\n", cfg_path, cfg_path);
+        exit(1);
+    }
+
+    size_t num_layers = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        if (strlen(line) > 3) num_layers++;
+    }
+    rewind(f);
+
+    Network net;
+    net.num_layers = num_layers;
+    net.layers = (Layer *) malloc(num_layers * sizeof(Layer));
+    memset(net.layers, 0, num_layers * sizeof(Layer));
+
+    size_t idx = 0;
+    while (fgets(line, sizeof(line), f) && idx < num_layers) {
+        if (strlen(line) <= 3) continue;
+
+        Layer *l = &net.layers[idx];
+        l->input1_idx = -1;
+        l->input2_idx = -1;
+
+        char type_str[32];
+        sscanf(line, "%d %31s", &l->id, type_str);
+
+        if (strcmp(type_str, "CONV") == 0) l->type = LAYER_CONV;
+        else if (strcmp(type_str, "DEPTHWISE") == 0) l->type = LAYER_DEPTHWISE_CONV;
+        else if (strcmp(type_str, "MAXPOOL") == 0) l->type = LAYER_MAXPOOL;
+        else if (strcmp(type_str, "RESIZE") == 0) l->type = LAYER_RESIZE;
+        else if (strcmp(type_str, "ADD") == 0) l->type = LAYER_ADD;
+        else if (strcmp(type_str, "TRANSPOSE") == 0) l->type = LAYER_TRANSPOSE;
+        else if (strcmp(type_str, "RESHAPE") == 0) l->type = LAYER_RESHAPE;
+        else if (strcmp(type_str, "SIGMOID") == 0) l->type = LAYER_SIGMOID;
+        else if (strcmp(type_str, "RELU") == 0) l->type = LAYER_RELU;
+
+        char *p;
+        if ((p = strstr(line, "inputs="))) {
+            char in_str[64];
+            sscanf(p + 7, "%63s", in_str);
+            if (strchr(in_str, ',')) {
+                sscanf(in_str, "%d,%d", &l->input1_idx, &l->input2_idx);
+            } else {
+                sscanf(in_str, "%d", &l->input1_idx);
+            }
+        }
+
+        if ((p = strstr(line, "stride="))) sscanf(p + 7, "%u", &l->stride);
+        if ((p = strstr(line, "pad="))) sscanf(p + 4, "%u", &l->padding);
+        int relu_int = 0;
+        if ((p = strstr(line, "relu="))) {
+            sscanf(p + 5, "%d", &relu_int);
+            l->apply_relu = (relu_int == 1);
+        }
+        if ((p = strstr(line, "kernel="))) {
+            sscanf(p + 7, "%u", &l->kernel_h);
+            l->kernel_w = l->kernel_h;
+        }
+        if ((p = strstr(line, "ref_count="))) sscanf(p + 10, "%d", &l->ref_count);
+        if ((p = strstr(line, "out_name="))) sscanf(p + 9, "%31s", l->out_name);
+
+        if ((p = strstr(line, "out_shape="))) {
+            char s_buf[64];
+            sscanf(p + 10, "%63s", s_buf);
+            uint32_t d1 = 1, d2 = 1, d3 = 1, d4 = 1;
+            int count = sscanf(s_buf, "%u,%u,%u,%u", &d1, &d2, &d3, &d4);
+            if (count == 4) {
+                l->out_n = d1;
+                l->out_c = d2;
+                l->out_h = d3;
+                l->out_w = d4;
+            } else if (count == 3) {
+                l->out_n = d1;
+                l->out_c = 1;
+                l->out_h = d2;
+                l->out_w = d3;
+            }
+        }
+
+        if (l->type == LAYER_CONV || l->type == LAYER_DEPTHWISE_CONV) {
+            char w_file[128] = {0};
+            char b_file[128] = {0};
+            if ((p = strstr(line, "weights="))) sscanf(p + 8, "%127s", w_file);
+            if ((p = strstr(line, "bias="))) sscanf(p + 5, "%127s", b_file);
+
+            char *ws = strstr(line, "w_shape=");
+            if (ws && strcmp(w_file, "NULL") != 0) {
+                uint32_t wn, wc, wh, ww;
+                sscanf(ws + 8, "%u,%u,%u,%u", &wn, &wc, &wh, &ww);
+                char path[256];
+                snprintf(path, sizeof(path), "%s/%s", final_weights_dir, w_file);
+                l->weights = load_weights(path, wn, wc, wh, ww);
+            }
+
+            if (strcmp(b_file, "NULL") != 0) {
+                char path[256];
+                snprintf(path, sizeof(path), "%s/%s", final_weights_dir, b_file);
+                load_bias(path, &l->bias, l->weights.batch);
+            }
+        }
+
+        idx++;
+    }
+
+    fclose(f);
+    return net;
+}
+
+NetworkOutputs forward_network(Network *net, const Tensor *input) {
+    //potential optimalization but for yunet it is only 2KB so it is ok i think
+    Tensor *outputs = (Tensor *) malloc(net->num_layers * sizeof(Tensor));
     if (!outputs) {
         fprintf(stderr, "CRITICAL ERROR: Memory allocation failed for outputs array\n");
         exit(1);
     }
+    //keep it for dynymic free
+    int32_t *live_refs = (int32_t *) malloc(net->num_layers * sizeof(int32_t));
+    for (size_t k = 0; k < net->num_layers; ++k) {
+        live_refs[k] = net->layers[k].ref_count;
+    }
 
     for (size_t i = 0; i < net->num_layers; ++i) {
         Layer *layer = &net->layers[i];
-        Tensor *in1 = (layer->input1_idx == -1) ? (Tensor *)input : &outputs[layer->input1_idx];
+        //check if it is input layer
+        Tensor *in1 = (layer->input1_idx == -1) ? (Tensor *) input : &outputs[layer->input1_idx];
+        Tensor *in2 = (layer->input2_idx != -1) ? &outputs[layer->input2_idx] : NULL;
 
-        Tensor *in2 = NULL;
-        if (layer->type == LAYER_ADD && layer->input2_idx != -1) {
-            in2 = &outputs[layer->input2_idx];
+        switch (layer->type) {
+            case LAYER_CONV:
+                outputs[i] = conv(in1, &layer->weights, &layer->bias, layer->stride, layer->padding, layer->apply_relu);
+                break;
+            case LAYER_DEPTHWISE_CONV:
+                outputs[i] = depthwise_conv2D(in1, &layer->weights, &layer->bias, layer->stride, layer->padding,
+                                              layer->apply_relu);
+                break;
+            case LAYER_MAXPOOL:
+                outputs[i] = maxPool(in1, layer->kernel_h, layer->stride);
+                break;
+            case LAYER_RESIZE:
+                outputs[i] = resize_nn_asymmetric(in1, layer->out_w, layer->out_h);
+                break;
+            case LAYER_ADD:
+                outputs[i] = add_tensors(in1, in2);
+                break;
+            case LAYER_TRANSPOSE:
+                outputs[i] = transpose(in1);
+                break;
+            case LAYER_RESHAPE:
+                outputs[i] = reshape(in1, layer->out_n, layer->out_c, layer->out_h, layer->out_w);
+                break;
+            case LAYER_SIGMOID:
+                outputs[i] = sigmoid(in1);
+                break;
+            case LAYER_RELU:
+                outputs[i] = relu(in1);
+                break;
+            default:
+                fprintf(stderr, "CRITICAL ERROR: Unsupported layer type %d at index %zu\n", layer->type, i);
+                exit(1);
         }
-
-        if (layer->type == LAYER_CONV) {
-            outputs[i] = conv(in1, &layer->weights, &layer->bias, layer->stride, layer->padding, layer->apply_relu);
+        if (layer->input1_idx != -1) {
+            live_refs[layer->input1_idx]--;
+            if (live_refs[layer->input1_idx] == 0) {
+                free_tensor(&outputs[layer->input1_idx]);
+            }
         }
-        else if (layer->type == LAYER_DEPTHWISE_CONV) {
-            outputs[i] = depthwise_conv2D(in1, &layer->weights, &layer->bias, layer->stride, layer->padding, layer->apply_relu);
-        }
-        else if (layer->type == LAYER_MAXPOOL) {
-            outputs[i] = maxPool(in1, layer->kernel_h, layer->stride);
-        }
-        else if (layer->type == LAYER_RESIZE) {
-            outputs[i] = resize_nn_asymmetric(in1, layer->target_w, layer->target_h);
-        }
-        else if (layer->type == LAYER_ADD) {
-            outputs[i] = add_tensors(in1, in2);
-        }
-        else {
-            fprintf(stderr, "CRITICAL ERROR: Unsupported layer type %d at index %zu\n", layer->type, i);
-            exit(1);
+    }
+    size_t out_count = 0;
+    for (size_t i = 0; i < net->num_layers; ++i) {
+        if (net->layers[i].ref_count == 0) {
+            out_count++;
         }
     }
 
-    Tensor final_result = outputs[net->num_layers - 1];
+    NetworkOutputs net_out;
+    net_out.count = out_count;
+    net_out.outputs = (OutputTensor *) malloc(out_count * sizeof(OutputTensor));
 
-    for (size_t i = 0; i < net->num_layers - 1; ++i) {
-        free_tensor(&outputs[i]);
+    size_t out_idx = 0;
+    for (size_t i = 0; i < net->num_layers; ++i) {
+        if (net->layers[i].ref_count == 0) {
+            strncpy(net_out.outputs[out_idx].name, net->layers[i].out_name, 31);
+            net_out.outputs[out_idx].name[31] = '\0';
+            net_out.outputs[out_idx].tensor = outputs[i];
+            out_idx++;
+        } else {
+            free_tensor(&outputs[i]);
+        }
     }
+
     free(outputs);
-
-    return final_result;
+    free(live_refs);
+    return net_out;
 }
+
+
 int main() {
+    printf("[*] Loading network...\n");
+    Network net = load_network("models/yunet.cfg", "models/yunet_weights");
+    printf("[+] Network loaded successfully! Num layers: %zu\n", net.num_layers);
+
+    printf("[*] Creating dummy input [1, 3, 640, 640]...\n");
+    Tensor input = create_Tensor(1, 3, 640, 640);
+    size_t total = 1 * 3 * 640 * 640;
+    for (size_t i = 0; i < total; ++i) input.data[i] = 1.0f;
+
+    printf("[*] Running forward pass...\n");
+    NetworkOutputs outs = forward_network(&net, &input);
+    printf("[+] Forward pass completed! Output count: %zu\n", outs.count);
+
+    for (size_t i = 0; i < outs.count; ++i) {
+        Tensor *t = &outs.outputs[i].tensor;
+        printf("    -> Output [%zu]: '%s' shape: [%u, %u, %u, %u], first val: %.4f\n",
+               i, outs.outputs[i].name, t->batch, t->channel, t->height, t->width, t->data[0]);
+    }
+
+    free_tensor(&input);
+    free_network_outputs(&outs);
+    free_network(&net);
+    printf("[+] Cleaned up memory. All good!\n");
+    return 0;
 }
