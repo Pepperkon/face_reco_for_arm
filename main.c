@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <math.h> //using it now but might implement my own in near future
 #include <stdbool.h>
+#include <omp.h>
 // =======> MEMORY ALLOCATION <=======
 /*
  * The most important part is not for Windows cause edge devices are mainly arm os
@@ -184,8 +185,8 @@ Tensor reshape(Tensor *t, const uint32_t new_n, const uint32_t new_c, const uint
 // ===============================
 
 // ========> ADD <================
-Tensor add_tensors(Tensor *t_1, const Tensor *t_2) {
-    Tensor res = create_Tensor(t_1->batch, t_1->channel, t_1->height, t_1->width);
+Tensor add_tensors(const Tensor *t_1, const Tensor *t_2) {
+    const Tensor res = create_Tensor(t_1->batch, t_1->channel, t_1->height, t_1->width);
     if (t_1->channel != t_2->channel || t_1->height != t_2->height || t_1->width != t_2->width) {
         fprintf(stderr, "CRITICAL ERROR: Tensors must have the same size to add them!\n");
         exit(1);
@@ -203,7 +204,7 @@ Tensor add_tensors(Tensor *t_1, const Tensor *t_2) {
 // change from nhwc to nchw
 Tensor transpose(const Tensor *t) {
     //                              n           c           h               w
-    Tensor res = create_Tensor(t->batch, t->height, t->width, t->channel);
+    const Tensor res = create_Tensor(t->batch, t->height, t->width, t->channel);
     for (uint32_t b = 0; b < t->batch; ++b) {
         for (uint32_t c = 0; c < t->channel; ++c) {
             for (uint32_t h = 0; h < t->height; ++h) {
@@ -324,37 +325,42 @@ Tensor conv(const Tensor *input, const Tensor *filter_tensor, const Float_vector
     uint32_t out_w = (input->width - kernel_w + 2 * padding) / stride + 1;
     Tensor out = create_Tensor(input->batch, out_channels, out_h, out_w);
 
+    float *outpointer = out.data;
+    const size_t input_channel_size = input->height * input->width;
     for (uint32_t b = 0; b < input->batch; ++b) {
         for (uint32_t c = 0; c < out_channels; ++c) {
             float bias_val = (bias != NULL && bias->size > c) ? bias->data[c] : 0.0f;
+            float *filter_pointer = filter_tensor->data + (c*in_channels *kernel_h*kernel_w);
+
             for (uint32_t y = 0; y < out_h; ++y) {
                 for (uint32_t x = 0; x < out_w; ++x) {
                     float sum = bias_val;
+                    float *weight_pointer = filter_pointer;
                     // we go through every filter tensor and tensor has parameters [ic,kh,kw] b in filter tensor is numvber of tensors
                     for (uint32_t ic = 0; ic < in_channels; ++ic) {
+                        float *input_channel_ptr = input->data + (b * in_channels * input_channel_size) + (ic * input_channel_size);
                         for (uint32_t ky = 0; ky < kernel_h; ++ky) {
+                            //if padding we skip (do not bother multiplying with 0)
+                            int32_t in_y = (y * stride) + ky - padding;
+                            if (in_y < 0 || in_y >= (int32_t)input->height) {
+                                weight_pointer += kernel_w;
+                                continue;
+                            }
                             for (uint32_t kx = 0; kx < kernel_w; ++kx) {
-                                //calculate parameters of input tensor
-                                int32_t in_y = (y * stride) + ky - padding;
                                 int32_t in_x = (x * stride) + kx - padding;
                                 //check if it is not padding (zeros)
-                                if (in_x >= 0 && in_x < (int32_t) input->width && in_y >= 0 && in_y < (int32_t) input->
-                                    height) {
-                                    size_t input_indx_x = get_index_of_pixel(
-                                        input, b, ic, (uint32_t) in_y, (uint32_t) in_x);
-                                    size_t filter_tensor_x = get_index_of_pixel(filter_tensor, c, ic, ky, kx);
-
-                                    sum += input->data[input_indx_x] * filter_tensor->data[filter_tensor_x];
+                                if (in_x >= 0 && in_x < (int32_t)input->width) {
+                                    size_t in_idx = in_y * input->width + in_x;
+                                    sum += input_channel_ptr[in_idx] * *weight_pointer;
                                 }
+                                weight_pointer++;
                             }
                         }
                     }
                     if (apply_relu && sum < 0.0f) {
                         sum = 0.0f;
                     }
-
-                    size_t out_idx = get_index_of_pixel(&out, b, c, y, x);
-                    out.data[out_idx] = sum;
+                *outpointer++ = sum;
                 }
             }
         }
@@ -385,36 +391,44 @@ Tensor depthwise_conv2D(const Tensor *input, const Tensor *filter_tensor, const 
     uint32_t out_w = (input->width - kernel_w + 2 * padding) / stride + 1;
     Tensor out = create_Tensor(input->batch, channels, out_h, out_w);
 
+    float *outpointer = out.data;
+    const size_t input_channel_size = input->height * input->width;
+    const size_t filter_size = kernel_h * kernel_w;
+
     for (uint32_t b = 0; b < input->batch; ++b) {
         for (uint32_t c = 0; c < channels; ++c) {
             float bias_val = (bias != NULL && bias->size > c) ? bias->data[c] : 0.0f;
+            float *filter_base_ptr = filter_tensor->data+c*filter_size;
+            float *input_channel_ptr = input->data + b*channels*input_channel_size + c*input_channel_size;
 
             for (uint32_t y = 0; y < out_h; ++y) {
                 for (uint32_t x = 0; x < out_w; ++x) {
                     float sum = bias_val;
+                    const float *w_ptr = filter_base_ptr;
                     // we go through every filter tensor (2 dimensions not 3 like standard conv [kw,kh]
                     // b in filter tensor is numvber of tensor
                     for (uint32_t ky = 0; ky < kernel_h; ++ky) {
+                        int32_t in_y = (y * stride) + ky - padding;
+                        if (in_y < 0 || in_y >= (int32_t)input->height) {
+                            w_ptr += kernel_w;
+                            continue;
+                        }
                         for (uint32_t kx = 0; kx < kernel_w; ++kx) {
                             //calculate parameters of input tensor
-                            int32_t in_y = (y * stride) + ky - padding;
                             int32_t in_x = (x * stride) + kx - padding;
                             //check if it is not padding (zeros)
-                            if (in_x >= 0 && in_x < (int32_t) input->width && in_y >= 0 && in_y < (int32_t) input->
-                                height) {
-                                size_t input_indx_x = get_index_of_pixel(input, b, c, (uint32_t) in_y, (uint32_t) in_x);
-                                size_t filter_tensor_x = get_index_of_pixel(filter_tensor, c, 0, ky, kx);
-
-                                sum += input->data[input_indx_x] * filter_tensor->data[filter_tensor_x];
+                            if (in_x >= 0 && in_x < (int32_t) input->width ) {
+                                size_t input_indx_x = in_y * input->width + in_x;
+                                sum += input_channel_ptr[input_indx_x] * *w_ptr;
                             }
+                            w_ptr++;
                         }
                     }
                     if (apply_relu && sum < 0.0f) {
                         sum = 0.0f;
                     }
 
-                    size_t out_idx = get_index_of_pixel(&out, b, c, y, x);
-                    out.data[out_idx] = sum;
+                    *outpointer++ = sum;
                 }
             }
         }
@@ -426,6 +440,7 @@ Tensor depthwise_conv2D(const Tensor *input, const Tensor *filter_tensor, const 
 
 
 // ===========> NEURAL NETWORK  <============
+// ===========>  FORWARD PASS <==============
 
 typedef enum {
     LAYER_CONV,
@@ -466,7 +481,7 @@ typedef struct {
     Tensor weights;
     Float_vector bias;
 
-    // Execution & Lifetime
+    // how many times neuron is used as input
     int32_t ref_count;
     char out_name[32]; // e.g. "cls_8", "bbox_16", or ""
 } Layer;
@@ -481,19 +496,11 @@ typedef struct {
     Tensor tensor;
 } OutputTensor;
 
+// for exmple: yunet has 12 outputs and sface has 1 output
 typedef struct {
     OutputTensor *outputs;
     size_t count;
 } NetworkOutputs;
-
-Tensor *get_output(NetworkOutputs *outs, const char *name) {
-    for (size_t i = 0; i < outs->count; ++i) {
-        if (strcmp(outs->outputs[i].name, name) == 0) {
-            return &outs->outputs[i].tensor;
-        }
-    }
-    return NULL;
-}
 
 void free_network_outputs(NetworkOutputs *outs) {
     for (size_t i = 0; i < outs->count; ++i) {
@@ -505,6 +512,7 @@ void free_network_outputs(NetworkOutputs *outs) {
     }
     outs->count = 0;
 }
+
 void free_network(Network *net) {
     for (size_t i = 0; i < net->num_layers; ++i) {
         if (net->layers[i].type == LAYER_CONV || net->layers[i].type == LAYER_DEPTHWISE_CONV) {
@@ -518,6 +526,7 @@ void free_network(Network *net) {
     }
     net->num_layers = 0;
 }
+
 Tensor load_weights(const char *filepath, uint32_t n, uint32_t c, uint32_t h, uint32_t w) {
     Tensor t = create_Tensor(n, c, h, w);
     FILE *f = fopen(filepath, "rb");
@@ -533,6 +542,7 @@ Tensor load_weights(const char *filepath, uint32_t n, uint32_t c, uint32_t h, ui
     fclose(f);
     return t;
 }
+
 void load_bias(const char *filepath, Float_vector *vec, uint32_t size) {
     vec_init(vec, size);
     FILE *f = fopen(filepath, "rb");
@@ -549,6 +559,7 @@ void load_bias(const char *filepath, Float_vector *vec, uint32_t size) {
 }
 
 Network load_network(const char *cfg_path, const char *weights_dir) {
+    // loading data
     FILE *f = fopen(cfg_path, "r");
     char final_weights_dir[256];
     strncpy(final_weights_dir, weights_dir, sizeof(final_weights_dir));
@@ -572,6 +583,7 @@ Network load_network(const char *cfg_path, const char *weights_dir) {
     while (fgets(line, sizeof(line), f)) {
         if (strlen(line) > 3) num_layers++;
     }
+    //reset pointer
     rewind(f);
 
     Network net;
@@ -679,7 +691,7 @@ NetworkOutputs forward_network(Network *net, const Tensor *input) {
         fprintf(stderr, "CRITICAL ERROR: Memory allocation failed for outputs array\n");
         exit(1);
     }
-    //keep it for dynymic free
+    // array for dynamic deletion of tensor (it is keeping number of references for each tensor)
     int32_t *live_refs = (int32_t *) malloc(net->num_layers * sizeof(int32_t));
     for (size_t k = 0; k < net->num_layers; ++k) {
         live_refs[k] = net->layers[k].ref_count;
@@ -761,6 +773,14 @@ NetworkOutputs forward_network(Network *net, const Tensor *input) {
 
 
 int main() {
+
+    uint32_t total_cores = omp_get_num_procs();
+    //we will use total cores - 1
+    uint32_t threads_available =  (total_cores > 1) ? (total_cores - 1) : 1;
+    omp_set_num_threads(threads_available);
+    printf("[*] Detected %d CPU cores. Using %d threads for inference (1 left for OS).\n",total_cores, threads_available);
+
+
     printf("[*] Loading network...\n");
     Network net = load_network("models/yunet.cfg", "models/yunet_weights");
     printf("[+] Network loaded successfully! Num layers: %zu\n", net.num_layers);
