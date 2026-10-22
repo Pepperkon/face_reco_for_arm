@@ -99,7 +99,7 @@ cd ..
 
 ```powershell
 # Compile with Release optimizations (-O3)
-gcc -O3 -Wall main.c -lm -o real_version
+gcc -O3 -Wall -fopenmp main.c -lm -o real_version
 
 # Run the inference engine
 .\real_version.exe
