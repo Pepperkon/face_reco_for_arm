@@ -18,8 +18,7 @@ def download_model(url, save_path, model_name):
 
 def main():
     url_yunet = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
-    url_sface = "https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx"
-
+    url_sface = "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx"
     save_path_yunet = "../models/face_detection_yunet_2023mar.onnx"
     save_path_sface = "../models/face_recognition_sface_2021dec.onnx"
 

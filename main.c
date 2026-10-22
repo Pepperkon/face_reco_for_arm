@@ -561,8 +561,8 @@ void load_bias(const char *filepath, Float_vector *vec, uint32_t size) {
 Network load_network(const char *cfg_path, const char *weights_dir) {
     // loading data
     FILE *f = fopen(cfg_path, "r");
-    char final_weights_dir[256];
-    strncpy(final_weights_dir, weights_dir, sizeof(final_weights_dir));
+    char final_weights_dir[512];
+    snprintf(final_weights_dir, sizeof(final_weights_dir), "%s", weights_dir);
 
     if (!f) {
         char fallback_cfg[512];
@@ -665,13 +665,13 @@ Network load_network(const char *cfg_path, const char *weights_dir) {
             if (ws && strcmp(w_file, "NULL") != 0) {
                 uint32_t wn, wc, wh, ww;
                 sscanf(ws + 8, "%u,%u,%u,%u", &wn, &wc, &wh, &ww);
-                char path[256];
+                char path[1024];
                 snprintf(path, sizeof(path), "%s/%s", final_weights_dir, w_file);
                 l->weights = load_weights(path, wn, wc, wh, ww);
             }
 
             if (strcmp(b_file, "NULL") != 0) {
-                char path[256];
+                char path[1024];
                 snprintf(path, sizeof(path), "%s/%s", final_weights_dir, b_file);
                 load_bias(path, &l->bias, l->weights.batch);
             }

@@ -7,8 +7,19 @@ models/*.pt
 models/*.tflite
 models/*.h5
 models/*.pb
+models/*.cfg
+models/yunet_weights/
+!models/.gitkeep
 
 dataset/
 *.jpg
 *.png
 *.npy
+
+build/
+cmake-build-*/
+real_version
+*.exe
+
+.idea/
+.vscode/
