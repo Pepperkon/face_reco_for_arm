@@ -8,6 +8,7 @@ models/*.tflite
 models/*.h5
 models/*.pb
 models/*.cfg
+models/*.bin
 models/yunet_weights/
 !models/.gitkeep
 
