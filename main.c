@@ -1,4 +1,4 @@
-#define _POSIX_C_SOURCE 200809L
+#define POSIX_C_SOURCE 200809L
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -6,6 +6,10 @@
 #include <math.h> //using it now but might implement my own in near future
 #include <stdbool.h>
 #include <omp.h>
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 // =======> MEMORY ALLOCATION <=======
 /*
  * The most important part is not for Windows cause edge devices are mainly arm os
@@ -13,12 +17,12 @@
  * so 4 float numbers, most optimized will be to work on few registers simultaneously, so alignment
  * to 32B will be good to work on 4 floats at the same time with one cache read
  */
-void *allocate_aligned(size_t alignment, size_t size) {
+static void *allocate_aligned(size_t alignment, size_t size) {
 #if defined(_WIN32) || defined(_WIN64)
     return _aligned_malloc(size, alignment);
 #else
     void *ptr = NULL;
-    uint32_t res = posix_memalign(&ptr, alignment, size);
+    const uint32_t res = posix_memalign(&ptr, alignment, size);
     if (res != 0) {
         fprintf(stderr, "ERROR: posix_memalign returned code %d\n", res);
         return NULL;
@@ -27,7 +31,7 @@ void *allocate_aligned(size_t alignment, size_t size) {
 #endif
 }
 
-void free_alligned(void *ptr) {
+static void free_alligned(void *ptr) {
     if (!ptr) {
         return;
     }
@@ -47,7 +51,7 @@ typedef struct {
     size_t size;
 } Float_vector;
 
-void vec_init(Float_vector *v, const size_t init_capacity) {
+static void vec_init(Float_vector *v, const size_t init_capacity) {
     v->size = 0;
     v->capacity = (init_capacity > 0) ? init_capacity : 4;
     v->data = (float *) malloc(v->capacity * sizeof(float));
@@ -57,7 +61,7 @@ void vec_init(Float_vector *v, const size_t init_capacity) {
     }
 }
 
-void vec_push(Float_vector *v, float val) {
+static void vec_push(Float_vector *v, const float val) {
     if (v->size == v->capacity) {
         v->capacity *= 2;
         float *new_data = realloc(v->data, v->capacity * sizeof(float));
@@ -71,7 +75,7 @@ void vec_push(Float_vector *v, float val) {
     ++v->size;
 }
 
-void vec_free(Float_vector *v) {
+static void vec_free(Float_vector *v) {
     if (v->data != NULL) {
         free(v->data);
         v->data = NULL;
@@ -93,12 +97,13 @@ typedef struct {
 } Tensor;
 
 //calculate index of pixel in location [n,c,h,w] (linear distrubiution in memory :) )
-size_t get_index_of_pixel(const Tensor *t, const uint32_t n, const uint32_t c, const uint32_t h, const uint32_t w) {
+static size_t get_index_of_pixel(const Tensor *t, const uint32_t n, const uint32_t c, const uint32_t h,
+                                 const uint32_t w) {
     return (size_t) n * (t->channel * t->width * t->height) +
            (size_t) c * (t->width * t->height) + (size_t) h * t->width + w;
 }
 
-Tensor create_Tensor(const uint32_t n, const uint32_t c, const uint32_t h, const uint32_t w) {
+static Tensor create_Tensor(const uint32_t n, const uint32_t c, const uint32_t h, const uint32_t w) {
     Tensor t;
     t.batch = n;
     t.channel = c;
@@ -106,8 +111,8 @@ Tensor create_Tensor(const uint32_t n, const uint32_t c, const uint32_t h, const
     t.width = w;
 
     //initializie data as zeros
-    size_t numOfPixels = (size_t) (n) * c * h * w;
-    size_t bytes = numOfPixels * sizeof(float);
+    const size_t numOfPixels = (size_t) (n) * c * h * w;
+    const size_t bytes = numOfPixels * sizeof(float);
     void *ptr = NULL;
     ptr = allocate_aligned(32, bytes);
     if (ptr == NULL) {
@@ -119,7 +124,7 @@ Tensor create_Tensor(const uint32_t n, const uint32_t c, const uint32_t h, const
     return t;
 }
 
-void free_tensor(Tensor *t) {
+static void free_tensor(Tensor *t) {
     if (t->data != NULL) {
         free_alligned(t->data);
         t->data = NULL;
@@ -132,14 +137,14 @@ void free_tensor(Tensor *t) {
 // ===========> RELU <============
 // lets do this in place
 // max(0, x)
-Tensor relu(Tensor *t) {
+static Tensor relu(Tensor *t) {
     const size_t total_elements = (size_t) t->batch * t->channel * t->height * t->width;
     for (size_t i = 0; i < total_elements; ++i) {
         if (t->data[i] < 0.0f) {
             t->data[i] = 0.0f;
         }
     }
-    Tensor res = *t;
+    const Tensor res = *t;
     t->data = NULL;
     t->batch = t->channel = t->height = t->width = 0;
     return res;
@@ -149,12 +154,12 @@ Tensor relu(Tensor *t) {
 
 // =========> SIGMOID <===========
 // 1 / (1 + e^(-x))
-Tensor sigmoid(Tensor *t) {
+static Tensor sigmoid(Tensor *t) {
     const size_t total_elements = (size_t) t->batch * t->channel * t->height * t->width;
     for (size_t i = 0; i < total_elements; ++i) {
         t->data[i] = 1.0f / (1.0f + expf(-t->data[i]));
     }
-    Tensor res = *t;
+    const Tensor res = *t;
     t->data = NULL;
     t->batch = t->channel = t->height = t->width = 0;
     return res;
@@ -163,7 +168,8 @@ Tensor sigmoid(Tensor *t) {
 // ===============================
 
 // =========> RESHAPE <===========
-Tensor reshape(Tensor *t, const uint32_t new_n, const uint32_t new_c, const uint32_t new_h, const uint32_t new_w) {
+static Tensor reshape(Tensor *t, const uint32_t new_n, const uint32_t new_c, const uint32_t new_h,
+                      const uint32_t new_w) {
     const size_t total_elements = (size_t) t->batch * t->channel * t->height * t->width;
     const size_t new_total_elements = (size_t) new_n * new_c * new_h * new_w;
     if (new_total_elements != total_elements) {
@@ -185,7 +191,7 @@ Tensor reshape(Tensor *t, const uint32_t new_n, const uint32_t new_c, const uint
 // ===============================
 
 // ========> ADD <================
-Tensor add_tensors(const Tensor *t_1, const Tensor *t_2) {
+static Tensor add_tensors(const Tensor *t_1, const Tensor *t_2) {
     const Tensor res = create_Tensor(t_1->batch, t_1->channel, t_1->height, t_1->width);
     if (t_1->channel != t_2->channel || t_1->height != t_2->height || t_1->width != t_2->width) {
         fprintf(stderr, "CRITICAL ERROR: Tensors must have the same size to add them!\n");
@@ -202,18 +208,18 @@ Tensor add_tensors(const Tensor *t_1, const Tensor *t_2) {
 
 // =======> TRANSPOSE <===========
 // change from nhwc to nchw
-Tensor transpose(const Tensor *t) {
+static Tensor transpose(const Tensor *t) {
     //                              n           c           h               w
     const Tensor res = create_Tensor(t->batch, t->height, t->width, t->channel);
     for (uint32_t b = 0; b < t->batch; ++b) {
         for (uint32_t c = 0; c < t->channel; ++c) {
             for (uint32_t h = 0; h < t->height; ++h) {
                 for (uint32_t w = 0; w < t->width; ++w) {
-                    size_t orginial_indx = get_index_of_pixel(t, b, c, h, w);
-                    size_t after_indx = (size_t) b * (t->height * t->channel * t->width) +
-                                        (size_t) h * (t->channel * t->width) +
-                                        (size_t) w * t->channel + c;
-                    res.data[after_indx] = t->data[orginial_indx];
+                    const size_t original_indx = get_index_of_pixel(t, b, c, h, w);
+                    const size_t after_indx = (size_t) b * (t->height * t->channel * t->width) +
+                                              (size_t) h * (t->channel * t->width) +
+                                              (size_t) w * t->channel + c;
+                    res.data[after_indx] = t->data[original_indx];
                 }
             }
         }
@@ -224,21 +230,21 @@ Tensor transpose(const Tensor *t) {
 // ===============================
 
 // =======> MAXPOOL_2D <=============
-Tensor maxPool(const Tensor *t, uint32_t pool_size, uint32_t stride) {
-    uint32_t new_h = (t->height - pool_size) / stride + 1;
-    uint32_t new_w = (t->width - pool_size) / stride + 1;
-    Tensor res = create_Tensor(t->batch, t->channel, new_h, new_w);
+static Tensor maxPool(const Tensor *t, uint32_t pool_size, uint32_t stride) {
+    const uint32_t new_h = (t->height - pool_size) / stride + 1;
+    const uint32_t new_w = (t->width - pool_size) / stride + 1;
+    const Tensor res = create_Tensor(t->batch, t->channel, new_h, new_w);
     for (uint32_t b = 0; b < t->batch; ++b) {
         for (uint32_t c = 0; c < t->channel; ++c) {
             for (uint32_t h = 0; h < new_h; ++h) {
                 for (uint32_t w = 0; w < new_w; ++w) {
-                    uint32_t res_indx = get_index_of_pixel(&res, b, c, h, w);
+                    const uint32_t res_indx = get_index_of_pixel(&res, b, c, h, w);
                     float max_val = -INFINITY;
                     for (uint32_t i = 0; i < pool_size; ++i) {
                         for (uint32_t j = 0; j < pool_size; ++j) {
-                            uint32_t t_i = (h * stride) + i; //columna ten
-                            uint32_t t_j = (w * stride) + j; //row
-                            uint32_t t_index = get_index_of_pixel(t, b, c, t_i, t_j);
+                            const uint32_t t_i = (h * stride) + i; //columna ten
+                            const uint32_t t_j = (w * stride) + j; //row
+                            const uint32_t t_index = get_index_of_pixel(t, b, c, t_i, t_j);
                             if (t->data[t_index] > max_val) {
                                 max_val = t->data[t_index];
                             }
@@ -259,10 +265,10 @@ Tensor maxPool(const Tensor *t, uint32_t pool_size, uint32_t stride) {
 // and for every pixel we do simple operation old_tensor_id = floor(new_tensor_index/ scale)
 // resize for channel and batches are left 1:1 hopefully...
 // ===============================
-Tensor resize_nn_asymmetric(const Tensor *t, const uint32_t new_width, const uint32_t new_height) {
-    Tensor res = create_Tensor(t->batch, t->channel, new_height, new_width);
-    float scale_x = (float) new_width / (float) t->width;
-    float scale_y = (float) new_height / (float) t->height;
+static Tensor resize_nn_asymmetric(const Tensor *t, const uint32_t new_width, const uint32_t new_height) {
+    const Tensor res = create_Tensor(t->batch, t->channel, new_height, new_width);
+    const float scale_x = (float) new_width / (float) t->width;
+    const float scale_y = (float) new_height / (float) t->height;
     for (uint32_t b = 0; b < t->batch; ++b) {
         for (uint32_t c = 0; c < t->channel; ++c) {
             for (uint32_t y = 0; y < new_height; ++y) {
@@ -273,8 +279,8 @@ Tensor resize_nn_asymmetric(const Tensor *t, const uint32_t new_width, const uin
                     if (old_y >= t->height) old_y = t->height - 1;
                     if (old_x >= t->width) old_x = t->width - 1;
 
-                    size_t new_tensor_index = get_index_of_pixel(&res, b, c, y, x);
-                    size_t old_tensor_index = get_index_of_pixel(t, b, c, old_y, old_x);
+                    const size_t new_tensor_index = get_index_of_pixel(&res, b, c, y, x);
+                    const size_t old_tensor_index = get_index_of_pixel(t, b, c, old_y, old_x);
 
                     res.data[new_tensor_index] = t->data[old_tensor_index];
                 }
@@ -307,13 +313,13 @@ Tensor resize_nn_asymmetric(const Tensor *t, const uint32_t new_width, const uin
 // out size formula is same for height and width O= floor((I-K+2P)/S) + 1, where I is input size, K is kernel size,
 // p is padding and S is Stride
 //  filter tensor params are [C_out, C_in, K_h, K_w] - c_out is number of channels on out tensor and C_in is channels _in
-Tensor conv(const Tensor *input, const Tensor *filter_tensor, const Float_vector *bias, const uint32_t stride,
-            const uint32_t padding, bool apply_relu) {
+static Tensor conv(const Tensor *input, const Tensor *filter_tensor, const Float_vector *bias, const uint32_t stride,
+                   const uint32_t padding, bool apply_relu) {
     //more clean names
-    uint32_t out_channels = filter_tensor->batch; // number of filters
-    uint32_t in_channels = filter_tensor->channel; // filter Z coordinate
-    uint32_t kernel_h = filter_tensor->height; // filter Y coordinate
-    uint32_t kernel_w = filter_tensor->width; // filter X coordinate
+    const uint32_t out_channels = filter_tensor->batch; // number of filters
+    const uint32_t in_channels = filter_tensor->channel; // filter Z coordinate
+    const uint32_t kernel_h = filter_tensor->height; // filter Y coordinate
+    const uint32_t kernel_w = filter_tensor->width; // filter X coordinate
 
     if (input->channel != in_channels) {
         fprintf(stderr, "CRITICAL ERROR: Input channels (%u) do not match weight in_channels (%u)!\n", input->channel,
@@ -321,36 +327,37 @@ Tensor conv(const Tensor *input, const Tensor *filter_tensor, const Float_vector
         exit(1);
     }
 
-    uint32_t out_h = (input->height - kernel_h + 2 * padding) / stride + 1;
-    uint32_t out_w = (input->width - kernel_w + 2 * padding) / stride + 1;
-    Tensor out = create_Tensor(input->batch, out_channels, out_h, out_w);
+    const uint32_t out_h = (input->height - kernel_h + 2 * padding) / stride + 1;
+    const uint32_t out_w = (input->width - kernel_w + 2 * padding) / stride + 1;
+    const Tensor out = create_Tensor(input->batch, out_channels, out_h, out_w);
 
     float *outpointer = out.data;
     const size_t input_channel_size = input->height * input->width;
     for (uint32_t b = 0; b < input->batch; ++b) {
         for (uint32_t c = 0; c < out_channels; ++c) {
-            float bias_val = (bias != NULL && bias->size > c) ? bias->data[c] : 0.0f;
-            float *filter_pointer = filter_tensor->data + (c*in_channels *kernel_h*kernel_w);
+            const float bias_val = (bias != NULL && bias->size > c) ? bias->data[c] : 0.0f;
+            float *filter_pointer = filter_tensor->data + (c * in_channels * kernel_h * kernel_w);
 
             for (uint32_t y = 0; y < out_h; ++y) {
                 for (uint32_t x = 0; x < out_w; ++x) {
                     float sum = bias_val;
-                    float *weight_pointer = filter_pointer;
+                    const float *weight_pointer = filter_pointer;
                     // we go through every filter tensor and tensor has parameters [ic,kh,kw] b in filter tensor is numvber of tensors
                     for (uint32_t ic = 0; ic < in_channels; ++ic) {
-                        float *input_channel_ptr = input->data + (b * in_channels * input_channel_size) + (ic * input_channel_size);
+                        const float *input_channel_ptr =
+                                input->data + (b * in_channels * input_channel_size) + (ic * input_channel_size);
                         for (uint32_t ky = 0; ky < kernel_h; ++ky) {
                             //if padding we skip (do not bother multiplying with 0)
-                            int32_t in_y = (y * stride) + ky - padding;
-                            if (in_y < 0 || in_y >= (int32_t)input->height) {
+                            const int32_t in_y = (y * stride) + ky - padding;
+                            if (in_y < 0 || in_y >= (int32_t) input->height) {
                                 weight_pointer += kernel_w;
                                 continue;
                             }
                             for (uint32_t kx = 0; kx < kernel_w; ++kx) {
-                                int32_t in_x = (x * stride) + kx - padding;
+                                const int32_t in_x = (x * stride) + kx - padding;
                                 //check if it is not padding (zeros)
-                                if (in_x >= 0 && in_x < (int32_t)input->width) {
-                                    size_t in_idx = in_y * input->width + in_x;
+                                if (in_x >= 0 && in_x < (int32_t) input->width) {
+                                    const size_t in_idx = in_y * input->width + in_x;
                                     sum += input_channel_ptr[in_idx] * *weight_pointer;
                                 }
                                 weight_pointer++;
@@ -360,7 +367,7 @@ Tensor conv(const Tensor *input, const Tensor *filter_tensor, const Float_vector
                     if (apply_relu && sum < 0.0f) {
                         sum = 0.0f;
                     }
-                *outpointer++ = sum;
+                    *outpointer++ = sum;
                 }
             }
         }
@@ -373,13 +380,13 @@ Tensor conv(const Tensor *input, const Tensor *filter_tensor, const Float_vector
 
 // it is numvber of channels times faster than standard conv!
 // =======> DepthWise Conv <======
-Tensor depthwise_conv2D(const Tensor *input, const Tensor *filter_tensor, const Float_vector *bias,
-                        const uint32_t stride,
-                        const uint32_t padding, bool apply_relu) {
+static Tensor depthwise_conv2D(const Tensor *input, const Tensor *filter_tensor, const Float_vector *bias,
+                               const uint32_t stride,
+                               const uint32_t padding, bool apply_relu) {
     // In Depthwise conv weights parameters are [number of channels, 1, kernel_h,kernel_w]
-    uint32_t channels = filter_tensor->batch; // number of filters
-    uint32_t kernel_h = filter_tensor->height; // filter Y coordinate
-    uint32_t kernel_w = filter_tensor->width; // filter X coordinate
+    const uint32_t channels = filter_tensor->batch; // number of filters
+    const uint32_t kernel_h = filter_tensor->height; // filter Y coordinate
+    const uint32_t kernel_w = filter_tensor->width; // filter X coordinate
 
     if (input->channel != channels) {
         fprintf(stderr, "CRITICAL ERROR: Input channels (%u) do not match weight filters (%u)!\n", input->channel,
@@ -387,9 +394,9 @@ Tensor depthwise_conv2D(const Tensor *input, const Tensor *filter_tensor, const 
         exit(1);
     }
 
-    uint32_t out_h = (input->height - kernel_h + 2 * padding) / stride + 1;
-    uint32_t out_w = (input->width - kernel_w + 2 * padding) / stride + 1;
-    Tensor out = create_Tensor(input->batch, channels, out_h, out_w);
+    const uint32_t out_h = (input->height - kernel_h + 2 * padding) / stride + 1;
+    const uint32_t out_w = (input->width - kernel_w + 2 * padding) / stride + 1;
+    const Tensor out = create_Tensor(input->batch, channels, out_h, out_w);
 
     float *outpointer = out.data;
     const size_t input_channel_size = input->height * input->width;
@@ -397,9 +404,9 @@ Tensor depthwise_conv2D(const Tensor *input, const Tensor *filter_tensor, const 
 
     for (uint32_t b = 0; b < input->batch; ++b) {
         for (uint32_t c = 0; c < channels; ++c) {
-            float bias_val = (bias != NULL && bias->size > c) ? bias->data[c] : 0.0f;
-            float *filter_base_ptr = filter_tensor->data+c*filter_size;
-            float *input_channel_ptr = input->data + b*channels*input_channel_size + c*input_channel_size;
+            const float bias_val = (bias != NULL && bias->size > c) ? bias->data[c] : 0.0f;
+            const float *filter_base_ptr = filter_tensor->data + c * filter_size;
+            const float *input_channel_ptr = input->data + b * channels * input_channel_size + c * input_channel_size;
 
             for (uint32_t y = 0; y < out_h; ++y) {
                 for (uint32_t x = 0; x < out_w; ++x) {
@@ -408,17 +415,17 @@ Tensor depthwise_conv2D(const Tensor *input, const Tensor *filter_tensor, const 
                     // we go through every filter tensor (2 dimensions not 3 like standard conv [kw,kh]
                     // b in filter tensor is numvber of tensor
                     for (uint32_t ky = 0; ky < kernel_h; ++ky) {
-                        int32_t in_y = (y * stride) + ky - padding;
-                        if (in_y < 0 || in_y >= (int32_t)input->height) {
+                        const int32_t in_y = (y * stride) + ky - padding;
+                        if (in_y < 0 || in_y >= (int32_t) input->height) {
                             w_ptr += kernel_w;
                             continue;
                         }
                         for (uint32_t kx = 0; kx < kernel_w; ++kx) {
                             //calculate parameters of input tensor
-                            int32_t in_x = (x * stride) + kx - padding;
+                            const int32_t in_x = (x * stride) + kx - padding;
                             //check if it is not padding (zeros)
-                            if (in_x >= 0 && in_x < (int32_t) input->width ) {
-                                size_t input_indx_x = in_y * input->width + in_x;
+                            if (in_x >= 0 && in_x < (int32_t) input->width) {
+                                const size_t input_indx_x = in_y * input->width + in_x;
                                 sum += input_channel_ptr[input_indx_x] * *w_ptr;
                             }
                             w_ptr++;
@@ -502,7 +509,7 @@ typedef struct {
     size_t count;
 } NetworkOutputs;
 
-void free_network_outputs(NetworkOutputs *outs) {
+static void free_network_outputs(NetworkOutputs *outs) {
     for (size_t i = 0; i < outs->count; ++i) {
         free_tensor(&outs->outputs[i].tensor);
     }
@@ -513,7 +520,7 @@ void free_network_outputs(NetworkOutputs *outs) {
     outs->count = 0;
 }
 
-void free_network(Network *net) {
+static void free_network(Network *net) {
     for (size_t i = 0; i < net->num_layers; ++i) {
         if (net->layers[i].type == LAYER_CONV || net->layers[i].type == LAYER_DEPTHWISE_CONV) {
             free_tensor(&net->layers[i].weights);
@@ -527,15 +534,15 @@ void free_network(Network *net) {
     net->num_layers = 0;
 }
 
-Tensor load_weights(const char *filepath, uint32_t n, uint32_t c, uint32_t h, uint32_t w) {
+static Tensor load_weights(const char *filepath, uint32_t n, uint32_t c, uint32_t h, uint32_t w) {
     Tensor t = create_Tensor(n, c, h, w);
     FILE *f = fopen(filepath, "rb");
     if (!f) {
         fprintf(stderr, "CRITICAL ERROR: Cannot open weight file %s\n", filepath);
         exit(1);
     }
-    size_t total_floats = (size_t) n * c * h * w;
-    size_t read_count = fread(t.data, sizeof(float), total_floats, f);
+    const size_t total_floats = (size_t) n * c * h * w;
+    const size_t read_count = fread(t.data, sizeof(float), total_floats, f);
     if (read_count != total_floats) {
         fprintf(stderr, "ERROR: Expected %zu floats in %s, read %zu\n", total_floats, filepath, read_count);
     }
@@ -543,14 +550,14 @@ Tensor load_weights(const char *filepath, uint32_t n, uint32_t c, uint32_t h, ui
     return t;
 }
 
-void load_bias(const char *filepath, Float_vector *vec, uint32_t size) {
+static void load_bias(const char *filepath, Float_vector *vec, uint32_t size) {
     vec_init(vec, size);
     FILE *f = fopen(filepath, "rb");
     if (!f) {
         fprintf(stderr, "CRITICAL ERROR: Cannot open bias file %s\n", filepath);
         exit(1);
     }
-    size_t read_count = fread(vec->data, sizeof(float), size, f);
+    const size_t read_count = fread(vec->data, sizeof(float), size, f);
     if (read_count != size) {
         fprintf(stderr, "ERROR: Expected %u bias floats in %s, read %zu\n", size, filepath, read_count);
     }
@@ -558,7 +565,7 @@ void load_bias(const char *filepath, Float_vector *vec, uint32_t size) {
     fclose(f);
 }
 
-Network load_network(const char *cfg_path, const char *weights_dir) {
+static Network load_network(const char *cfg_path, const char *weights_dir) {
     // loading data
     FILE *f = fopen(cfg_path, "r");
     char final_weights_dir[256];
@@ -641,7 +648,7 @@ Network load_network(const char *cfg_path, const char *weights_dir) {
             char s_buf[64];
             sscanf(p + 10, "%63s", s_buf);
             uint32_t d1 = 1, d2 = 1, d3 = 1, d4 = 1;
-            int count = sscanf(s_buf, "%u,%u,%u,%u", &d1, &d2, &d3, &d4);
+            const int count = sscanf(s_buf, "%u,%u,%u,%u", &d1, &d2, &d3, &d4);
             if (count == 4) {
                 l->out_n = d1;
                 l->out_c = d2;
@@ -661,7 +668,7 @@ Network load_network(const char *cfg_path, const char *weights_dir) {
             if ((p = strstr(line, "weights="))) sscanf(p + 8, "%127s", w_file);
             if ((p = strstr(line, "bias="))) sscanf(p + 5, "%127s", b_file);
 
-            char *ws = strstr(line, "w_shape=");
+            const char *ws = strstr(line, "w_shape=");
             if (ws && strcmp(w_file, "NULL") != 0) {
                 uint32_t wn, wc, wh, ww;
                 sscanf(ws + 8, "%u,%u,%u,%u", &wn, &wc, &wh, &ww);
@@ -684,7 +691,7 @@ Network load_network(const char *cfg_path, const char *weights_dir) {
     return net;
 }
 
-NetworkOutputs forward_network(Network *net, const Tensor *input) {
+static NetworkOutputs forward_network(const Network *net, const Tensor *input) {
     //potential optimalization but for yunet it is only 2KB so it is ok i think
     Tensor *outputs = (Tensor *) malloc(net->num_layers * sizeof(Tensor));
     if (!outputs) {
@@ -698,10 +705,10 @@ NetworkOutputs forward_network(Network *net, const Tensor *input) {
     }
 
     for (size_t i = 0; i < net->num_layers; ++i) {
-        Layer *layer = &net->layers[i];
+        const Layer *layer = &net->layers[i];
         //check if it is input layer
         Tensor *in1 = (layer->input1_idx == -1) ? (Tensor *) input : &outputs[layer->input1_idx];
-        Tensor *in2 = (layer->input2_idx != -1) ? &outputs[layer->input2_idx] : NULL;
+        const Tensor *in2 = (layer->input2_idx != -1) ? &outputs[layer->input2_idx] : NULL;
 
         switch (layer->type) {
             case LAYER_CONV:
@@ -771,24 +778,324 @@ NetworkOutputs forward_network(Network *net, const Tensor *input) {
     return net_out;
 }
 
+// =====================================================
+// ===============> DECODING YUNET <====================
+// =====================================================
+
+typedef struct {
+    float x, y, w, h; // [x,y,width,height] of bbox (x y are center of bbox not lef top corner)
+    float landmarks[10]; // [x1,y2  x2,y2...] 5 face point left\right eye, nose , left/right side of mouth
+    float confidence; //result of cls*obj (confidence there is a face * quality of bounding box)
+    bool isRemoved; //true after nms
+} Face;
+
+typedef struct {
+    Face *faces;
+    size_t size;
+    size_t capacity;
+} FaceVector;
+
+static void face_vec_init(FaceVector *v, const size_t init_capacity) {
+    v->size = 0;
+    v->capacity = (init_capacity > 0) ? init_capacity : 16;
+    v->faces = (Face *) malloc(v->capacity * sizeof(Face));
+    if (v->faces == NULL) {
+        fprintf(stderr, "ERROR: WRONG FACE VECTOR ALLOCATION\n");
+        exit(1);
+    }
+}
+
+static void face_vec_push(FaceVector *v, Face f) {
+    if (v->size == v->capacity) {
+        v->capacity *= 2;
+        Face *new_faces = (Face *) realloc(v->faces, v->capacity * sizeof(Face));
+        if (new_faces == NULL) {
+            fprintf(stderr, "ERROR: WRONG FACE VECTOR ALLOCATION\n");
+            exit(1);
+        }
+        v->faces = new_faces;
+    }
+    v->faces[v->size] = f;
+    ++v->size;
+}
+
+static void face_vec_free(FaceVector *v) {
+    if (v->faces != NULL) {
+        free(v->faces);
+        v->faces = NULL;
+    }
+    v->capacity = 0;
+    v->size = 0;
+}
+
+static const Tensor *find_output_tensor(const NetworkOutputs *outs, const char *name) {
+    for (size_t k = 0; k < outs->count; ++k) {
+        if (strcmp(outs->outputs[k].name, name) == 0) {
+            return &outs->outputs[k].tensor;
+        }
+    }
+    return NULL;
+}
+
+static void decode_yunet(const NetworkOutputs *outs, FaceVector *faces,
+                         uint32_t input_height, uint32_t input_width, float score_treshold) {
+    uint32_t strides[3] = {8, 16, 32};
+    const float score_tresh_sq = score_treshold * score_treshold;
+
+    for (int s = 0; s < 3; ++s) {
+        const uint32_t stride = strides[s];
+        char cls_name[16], obj_name[16], bbox_name[16], kps_name[16];
+        snprintf(cls_name, sizeof(cls_name), "cls_%u", stride);
+        snprintf(obj_name, sizeof(obj_name), "obj_%u", stride);
+        snprintf(bbox_name, sizeof(bbox_name), "bbox_%u", stride);
+        snprintf(kps_name, sizeof(kps_name), "kps_%u", stride);
+
+        //GET OUTPUT FOR EVERY STRIDE
+        Tensor *cls_t = find_output_tensor(outs, cls_name);
+        Tensor *obj_t = find_output_tensor(outs, obj_name);
+        Tensor *bbox_t = find_output_tensor(outs, bbox_name);
+        Tensor *kps_t = find_output_tensor(outs, kps_name);
+
+        if (!cls_t || !obj_t || !bbox_t || !kps_t) {
+            fprintf(stderr, "WARNING: Missing heads for stride %u\n", stride);
+            continue;
+        }
+        // how many potential faces for every stride
+        uint32_t colums = input_width / stride;
+        uint32_t rows = input_height / stride;
+        const float *cls_ptr = cls_t->data;
+        const float *obj_ptr = obj_t->data;
+        const float *bbox_ptr = bbox_t->data;
+        const float *kps_ptr = kps_t->data;
+
+        for (uint32_t r = 0; r < rows; ++r) {
+            for (uint32_t c = 0; c < colums; ++c) {
+                size_t indx = r * colums + c;
+
+                float cls = cls_ptr[indx];
+                if (cls < score_tresh_sq) continue;
+                if (cls > 1.0f)cls = 1.0f;
+
+                float obj = obj_ptr[indx];
+                if (obj <= 0.0f) continue;
+                if (obj > 1.0f) obj = 1.0f;
+
+
+                const float scr = cls * obj;
+                if (scr < score_tresh_sq) continue;
+
+                const float score = sqrtf(scr);
+
+                //decode bbox (every bbox has 4 parameters)
+                const float *b = &bbox_ptr[indx * 4];
+                const float center_x = ((float) c + b[0]) * (float) stride;
+                const float center_y = ((float) r + b[1]) * (float) stride;
+                //remember that r and c are indexes of these small squares
+                const float w = expf(b[2]) * (float) stride;
+                const float h = expf(b[3]) * (float) stride;
+
+                Face face;
+                face.confidence = score;
+                face.x = center_x - w * 0.5f;
+                face.y = center_y - h * 0.5f;
+                face.w = w;
+                face.h = h;
+                face.isRemoved=false;
+
+                //decode landmarks
+                const float *kps = &kps_ptr[indx * 10];
+                for (uint32_t k = 0; k < 5; ++k) {
+                    face.landmarks[k * 2] = (kps[k * 2] + (float) c) * (float) stride;
+                    face.landmarks[k * 2 + 1] = (kps[k * 2 + 1] + (float) r) * (float) stride;
+                }
+                face_vec_push(faces, face);
+            }
+        }
+    }
+}
+//calculate how much lider's bounding box is in this b bounding box if more than treshold it is removed, if not it is other face
+static float calculate_iou(const Face *a, const Face *b) {
+    //get union ara
+    float x1 = (a->x > b->x) ? a->x : b->x;
+    float y1 = (a->y > b->y) ? a->y : b->y;
+    float x2 = ((a->x + a->w) < (b->x + b->w)) ? (a->x + a->w) : (b->x + b->w);
+    float y2 = ((a->y + a->h) < (b->y + b->h)) ? (a->y + a->h) : (b->y + b->h);
+    float inter_w = x2 - x1;
+    float inter_h = y2 - y1;
+    if (inter_w <= 0.0f || inter_h <= 0.0f) return 0.0f;
+
+    float inter_area = inter_w * inter_h;
+    float union_area = (a->w * a->h) + (b->w * b->h) - inter_area;
+
+    return (union_area > 0.0f) ? (inter_area / union_area) : 0.0f;
+
+}
+static int compare_faces_desc(const void *a, const void *b) {
+    const Face *fa = (const Face *) a;
+    const Face *fb = (const Face *) b;
+    if (fb->confidence >fa->confidence) return 1;
+    if (fb->confidence < fa->confidence) return -1;
+    return 0;
+}
+void nms(FaceVector *faces_vector, float nms_thresh) {
+    if (faces_vector->size <= 1) return;
+    qsort(faces_vector->faces, faces_vector->size, sizeof(Face), compare_faces_desc);
+
+    for (size_t i = 0; i < faces_vector->size; ++i) {
+        if (faces_vector->faces[i].isRemoved) continue;
+        for (size_t j = i + 1; j < faces_vector->size; ++j) {
+            if (faces_vector->faces[j].isRemoved) continue;
+
+            if (calculate_iou(&faces_vector->faces[i], &faces_vector->faces[j]) > nms_thresh) {
+                faces_vector->faces[j].isRemoved = true;
+
+            }
+        }
+    }
+    //compact vector
+    size_t write_idx = 0;
+    for (size_t i = 0; i < faces_vector->size; ++i) {
+        if (!faces_vector->faces[i].isRemoved) {
+            if (write_idx!=i) {
+                faces_vector->faces[write_idx] = faces_vector->faces[i];
+            }
+            write_idx++;
+        }
+    }
+    faces_vector->size = write_idx;
+}
+Tensor load_image_as_tensor(const char *filepath, uint32_t target_w, uint32_t target_h) {
+    int img_w, img_h, channels;
+    // load RGB
+    unsigned char *raw_data = stbi_load(filepath, &img_w, &img_h, &channels, 3);
+    if (!raw_data) {
+        fprintf(stderr, "ERROR: Cannot load image file '%s'\n", filepath);
+        exit(1);
+    }
+    printf("[+] Image '%s' loaded! Dimensions: %dx%d\n", filepath, img_w, img_h);
+
+    // [1, 3, img_h, img_w]
+    Tensor raw_tensor = create_Tensor(1, 3, img_h, img_w);
+
+    // HWC -> NCHW
+    size_t plane_size = (size_t) img_h * img_w;
+    for (size_t i = 0; i < plane_size; ++i) {
+        raw_tensor.data[0 * plane_size + i] = (float) raw_data[i * 3 + 2]; // B
+        raw_tensor.data[1 * plane_size + i] = (float) raw_data[i * 3 + 1]; // G
+        raw_tensor.data[2 * plane_size + i] = (float) raw_data[i * 3 + 0]; // R
+    }
+    stbi_image_free(raw_data);
+
+    // if it has good size
+    if ((uint32_t) img_w == target_w && (uint32_t) img_h == target_h) {
+        return raw_tensor;
+    }
+
+    //resize if not
+    printf("[*] Resizing tensor from [%dx%d] to [%ux%u]...\n", img_w, img_h, target_w, target_h);
+    Tensor resized = resize_nn_asymmetric(&raw_tensor, target_w, target_h);
+    free_tensor(&raw_tensor);
+
+    return resized;
+}
+
+static void draw_point(unsigned char *img, int img_w, int img_h, int cx, int cy, int radius, unsigned char r,
+                       unsigned char g, unsigned char b) {
+    for (int dy = -radius; dy <= radius; ++dy) {
+        for (int dx = -radius; dx <= radius; ++dx) {
+            if (dx * dx + dy * dy <= radius * radius) {
+                int px = cx + dx;
+                int py = cy + dy;
+                if (px >= 0 && px < img_w && py >= 0 && py < img_h) {
+                    int idx = (py * img_w + px) * 3;
+                    img[idx + 0] = r;
+                    img[idx + 1] = g;
+                    img[idx + 2] = b;
+                }
+            }
+        }
+    }
+}
+
+static void draw_detections(const char *image_path, const FaceVector *faces, const char *output_path) {
+    int w, h, ch;
+    unsigned char *img = stbi_load(image_path, &w, &h, &ch, 3);
+    if (!img) {
+        char fallback[512];
+        snprintf(fallback, sizeof(fallback), "../%s", image_path);
+        img = stbi_load(fallback, &w, &h, &ch, 3);
+    }
+
+    if (!img) {
+        fprintf(stderr, "ERROR: Cannot open image '%s' to draw detections!\n", image_path);
+        return;
+    }
+
+    float scale_x = (float) w / 640.0f;
+    float scale_y = (float) h / 640.0f;
+
+    for (size_t i = 0; i < faces->size; ++i) {
+        Face *f = &faces->faces[i];
+
+        int rx = (int) (f->x * scale_x);
+        int ry = (int) (f->y * scale_y);
+        int rw = (int) (f->w * scale_x);
+        int rh = (int) (f->h * scale_y);
+
+        int x_min = (rx < 0) ? 0 : rx;
+        int y_min = (ry < 0) ? 0 : ry;
+        int x_max = (rx + rw >= w) ? w - 1 : rx + rw;
+        int y_max = (ry + rh >= h) ? h - 1 : ry + rh;
+
+        // DRAW BOX
+        int thickness = 3;
+        for (int y = y_min; y <= y_max; ++y) {
+            for (int x = x_min; x <= x_max; ++x) {
+                if (x < rx + thickness || x > rx + rw - thickness ||
+                    y < ry + thickness || y > ry + rh - thickness) {
+                    int idx = (y * w + x) * 3;
+                    img[idx + 0] = 0; // R
+                    img[idx + 1] = 255; // G
+                    img[idx + 2] = 0; // B
+                }
+            }
+        }
+
+        unsigned char colors[5][3] = {
+            {255, 0, 0},
+            {255, 0, 0},
+            {0, 120, 255},
+            {255, 255, 0},
+            {255, 255, 0}
+        };
+
+        for (int k = 0; k < 5; ++k) {
+            int lx = (int) (f->landmarks[k * 2 + 0] * scale_x);
+            int ly = (int) (f->landmarks[k * 2 + 1] * scale_y);
+            draw_point(img, w, h, lx, ly, 4, colors[k][0], colors[k][1], colors[k][2]);
+        }
+    }
+
+    stbi_write_png(output_path, w, h, 3, img, w * 3);
+    printf("[+] Successfully saved annotated image to: %s\n", output_path);
+    stbi_image_free(img);
+}
+
 
 int main() {
-
-    uint32_t total_cores = omp_get_num_procs();
+    const uint32_t total_cores = omp_get_num_procs();
     //we will use total cores - 1
-    uint32_t threads_available =  (total_cores > 1) ? (total_cores - 1) : 1;
+    const uint32_t threads_available = (total_cores > 1) ? (total_cores - 1) : 1;
     omp_set_num_threads(threads_available);
-    printf("[*] Detected %d CPU cores. Using %d threads for inference (1 left for OS).\n",total_cores, threads_available);
-
+    printf("[*] Detected %d CPU cores. Using %d threads for inference (1 left for OS).\n", total_cores,
+           threads_available);
 
     printf("[*] Loading network...\n");
     Network net = load_network("models/yunet.cfg", "models/yunet_weights");
     printf("[+] Network loaded successfully! Num layers: %zu\n", net.num_layers);
 
-    printf("[*] Creating dummy input [1, 3, 640, 640]...\n");
-    Tensor input = create_Tensor(1, 3, 640, 640);
-    size_t total = 1 * 3 * 640 * 640;
-    for (size_t i = 0; i < total; ++i) input.data[i] = 1.0f;
+    printf("[*] Loading image to tensor...\n");
+    Tensor input = load_image_as_tensor("robert.jpg", 640, 640);
 
     printf("[*] Running forward pass...\n");
     NetworkOutputs outs = forward_network(&net, &input);
@@ -799,7 +1106,25 @@ int main() {
         printf("    -> Output [%zu]: '%s' shape: [%u, %u, %u, %u], first val: %.4f\n",
                i, outs.outputs[i].name, t->batch, t->channel, t->height, t->width, t->data[0]);
     }
+    FaceVector faces;
+    face_vec_init(&faces, 32);
 
+    decode_yunet(&outs, &faces, 640, 640, 0.6f);
+
+    printf("[+] Decoded %zu candidate faces (before NMS)\n", faces.size);
+    nms(&faces, 0.3f);
+    printf("[+] Detected %zu faces after NMS!\n", faces.size);
+
+    for (size_t i = 0; i < faces.size; ++i) {
+        Face *f = &faces.faces[i];
+        printf("    Face [%zu]: score=%.4f, bbox=[x=%.1f, y=%.1f, w=%.1f, h=%.1f]\n",
+               i, f->confidence, f->x, f->y, f->w, f->h);
+        printf("               landmarks: right_eye=(%.1f, %.1f), left_eye=(%.1f, %.1f), nose=(%.1f, %.1f)\n",
+               f->landmarks[0], f->landmarks[1], f->landmarks[2], f->landmarks[3], f->landmarks[4], f->landmarks[5]);
+    }
+
+    draw_detections("robert.jpg", &faces, "test_output.png");
+    face_vec_free(&faces);
     free_tensor(&input);
     free_network_outputs(&outs);
     free_network(&net);
