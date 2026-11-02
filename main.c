@@ -4,7 +4,6 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h> //using it now but might implement my own in near future
-#include <stdbool.h>
 #include <omp.h>
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -31,7 +30,7 @@ static void *allocate_aligned(size_t alignment, size_t size) {
 #endif
 }
 
-static void free_alligned(void *ptr) {
+static void free_aligned(void *ptr) {
     if (!ptr) {
         return;
     }
@@ -96,7 +95,7 @@ typedef struct {
     float *data;
 } Tensor;
 
-//calculate index of pixel in location [n,c,h,w] (linear distrubiution in memory :) )
+//calculate index of pixel in location [n,c,h,w] (linear distribution in memory :) )
 static size_t get_index_of_pixel(const Tensor *t, const uint32_t n, const uint32_t c, const uint32_t h,
                                  const uint32_t w) {
     return (size_t) n * (t->channel * t->width * t->height) +
@@ -110,7 +109,7 @@ static Tensor create_Tensor(const uint32_t n, const uint32_t c, const uint32_t h
     t.height = h;
     t.width = w;
 
-    //initializie data as zeros
+    //initialize data as zeros
     const size_t numOfPixels = (size_t) (n) * c * h * w;
     const size_t bytes = numOfPixels * sizeof(float);
     void *ptr = NULL;
@@ -126,13 +125,14 @@ static Tensor create_Tensor(const uint32_t n, const uint32_t c, const uint32_t h
 
 static void free_tensor(Tensor *t) {
     if (t->data != NULL) {
-        free_alligned(t->data);
+        free_aligned(t->data);
         t->data = NULL;
     }
     t->batch = t->channel = t->height = t->width = 0;
 }
-
 // ===============================
+
+// ===================> LAYER TYPES <==========================
 
 // ===========> RELU <============
 // lets do this in place
@@ -149,7 +149,6 @@ static Tensor relu(Tensor *t) {
     t->batch = t->channel = t->height = t->width = 0;
     return res;
 }
-
 // ===============================
 
 // =========> SIGMOID <===========
@@ -164,7 +163,6 @@ static Tensor sigmoid(Tensor *t) {
     t->batch = t->channel = t->height = t->width = 0;
     return res;
 }
-
 // ===============================
 
 // =========> RESHAPE <===========
@@ -187,7 +185,6 @@ static Tensor reshape(Tensor *t, const uint32_t new_n, const uint32_t new_c, con
     t->batch = t->channel = t->height = t->width = 0;
     return res;
 }
-
 // ===============================
 
 // ========> ADD <================
@@ -203,7 +200,6 @@ static Tensor add_tensors(const Tensor *t_1, const Tensor *t_2) {
     }
     return res;
 }
-
 // ===============================
 
 // =======> TRANSPOSE <===========
@@ -226,10 +222,9 @@ static Tensor transpose(const Tensor *t) {
     }
     return res;
 }
-
 // ===============================
 
-// =======> MAXPOOL_2D <=============
+// =======> MAX-POOL_2D <=============
 static Tensor maxPool(const Tensor *t, uint32_t pool_size, uint32_t stride) {
     const uint32_t new_h = (t->height - pool_size) / stride + 1;
     const uint32_t new_w = (t->width - pool_size) / stride + 1;
@@ -257,7 +252,6 @@ static Tensor maxPool(const Tensor *t, uint32_t pool_size, uint32_t stride) {
     }
     return res;
 }
-
 // ===============================
 
 // ==========> RESIZE <===========
@@ -289,11 +283,9 @@ static Tensor resize_nn_asymmetric(const Tensor *t, const uint32_t new_width, co
     }
     return res;
 }
-
 // ===============================
 
 // ====> Batch Normalization <====
-
 // ===============================
 
 // ===========> PRLEU <===========
@@ -313,8 +305,7 @@ static Tensor resize_nn_asymmetric(const Tensor *t, const uint32_t new_width, co
 // out size formula is same for height and width O= floor((I-K+2P)/S) + 1, where I is input size, K is kernel size,
 // p is padding and S is Stride
 //  filter tensor params are [C_out, C_in, K_h, K_w] - c_out is number of channels on out tensor and C_in is channels _in
-static Tensor conv(const Tensor *input, const Tensor *filter_tensor, const Float_vector *bias, const uint32_t stride,
-                   const uint32_t padding, bool apply_relu) {
+static Tensor conv(const Tensor *input, const Tensor *filter_tensor, const Float_vector *bias, const uint32_t stride, const uint32_t padding, bool apply_relu) {
     //more clean names
     const uint32_t out_channels = filter_tensor->batch; // number of filters
     const uint32_t in_channels = filter_tensor->channel; // filter Z coordinate
@@ -331,10 +322,13 @@ static Tensor conv(const Tensor *input, const Tensor *filter_tensor, const Float
     const uint32_t out_w = (input->width - kernel_w + 2 * padding) / stride + 1;
     const Tensor out = create_Tensor(input->batch, out_channels, out_h, out_w);
 
-    float *outpointer = out.data;
+    const size_t out_channel_size = (size_t)out_h * out_w;
     const size_t input_channel_size = input->height * input->width;
+
     for (uint32_t b = 0; b < input->batch; ++b) {
+        #pragma omp parallel for
         for (uint32_t c = 0; c < out_channels; ++c) {
+            float *out_c_pointer = out.data + b*out_channels* out_channel_size + c*out_channel_size;
             const float bias_val = (bias != NULL && bias->size > c) ? bias->data[c] : 0.0f;
             float *filter_pointer = filter_tensor->data + (c * in_channels * kernel_h * kernel_w);
 
@@ -367,18 +361,16 @@ static Tensor conv(const Tensor *input, const Tensor *filter_tensor, const Float
                     if (apply_relu && sum < 0.0f) {
                         sum = 0.0f;
                     }
-                    *outpointer++ = sum;
+                    *out_c_pointer = sum;
+                    out_c_pointer++;
                 }
             }
         }
     }
     return out;
 }
-
-
 // ===============================
 
-// it is numvber of channels times faster than standard conv!
 // =======> DepthWise Conv <======
 static Tensor depthwise_conv2D(const Tensor *input, const Tensor *filter_tensor, const Float_vector *bias,
                                const uint32_t stride,
@@ -398,12 +390,14 @@ static Tensor depthwise_conv2D(const Tensor *input, const Tensor *filter_tensor,
     const uint32_t out_w = (input->width - kernel_w + 2 * padding) / stride + 1;
     const Tensor out = create_Tensor(input->batch, channels, out_h, out_w);
 
-    float *outpointer = out.data;
     const size_t input_channel_size = input->height * input->width;
     const size_t filter_size = kernel_h * kernel_w;
+    const size_t out_channel_size = (size_t)out_h * out_w;
 
     for (uint32_t b = 0; b < input->batch; ++b) {
+#pragma omp parallel for
         for (uint32_t c = 0; c < channels; ++c) {
+            float *out_c_pointer = out.data + b*channels*out_channel_size + c*out_channel_size;
             const float bias_val = (bias != NULL && bias->size > c) ? bias->data[c] : 0.0f;
             const float *filter_base_ptr = filter_tensor->data + c * filter_size;
             const float *input_channel_ptr = input->data + b * channels * input_channel_size + c * input_channel_size;
@@ -435,20 +429,18 @@ static Tensor depthwise_conv2D(const Tensor *input, const Tensor *filter_tensor,
                         sum = 0.0f;
                     }
 
-                    *outpointer++ = sum;
+                    *out_c_pointer = sum;
+                    out_c_pointer++;
                 }
             }
         }
     }
     return out;
 }
-
 // ===============================
 
 
-// ===========> NEURAL NETWORK  <============
 // ===========>  FORWARD PASS <==============
-
 typedef enum {
     LAYER_CONV,
     LAYER_DEPTHWISE_CONV,
@@ -692,7 +684,7 @@ static Network load_network(const char *cfg_path, const char *weights_dir) {
 }
 
 static NetworkOutputs forward_network(const Network *net, const Tensor *input) {
-    //potential optimalization but for yunet it is only 2KB so it is ok i think
+    //potential optimization but for yunet it is only 2KB so it is ok i think
     Tensor *outputs = (Tensor *) malloc(net->num_layers * sizeof(Tensor));
     if (!outputs) {
         fprintf(stderr, "CRITICAL ERROR: Memory allocation failed for outputs array\n");
@@ -778,10 +770,7 @@ static NetworkOutputs forward_network(const Network *net, const Tensor *input) {
     return net_out;
 }
 
-// =====================================================
-// ===============> DECODING YUNET <====================
-// =====================================================
-
+// ==================> Face objects <============
 typedef struct {
     float x, y, w, h; // [x,y,width,height] of bbox (x y are center of bbox not lef top corner)
     float landmarks[10]; // [x1,y2  x2,y2...] 5 face point left\right eye, nose , left/right side of mouth
@@ -837,6 +826,7 @@ static const Tensor *find_output_tensor(const NetworkOutputs *outs, const char *
     return NULL;
 }
 
+// ========> Yunet Decoding <============
 static void decode_yunet(const NetworkOutputs *outs, FaceVector *faces,
                          uint32_t input_height, uint32_t input_width, float score_treshold) {
     uint32_t strides[3] = {8, 16, 32};
@@ -861,16 +851,16 @@ static void decode_yunet(const NetworkOutputs *outs, FaceVector *faces,
             continue;
         }
         // how many potential faces for every stride
-        uint32_t colums = input_width / stride;
-        uint32_t rows = input_height / stride;
+        const uint32_t columns = input_width / stride;
+        const uint32_t rows = input_height / stride;
         const float *cls_ptr = cls_t->data;
         const float *obj_ptr = obj_t->data;
         const float *bbox_ptr = bbox_t->data;
         const float *kps_ptr = kps_t->data;
 
         for (uint32_t r = 0; r < rows; ++r) {
-            for (uint32_t c = 0; c < colums; ++c) {
-                size_t indx = r * colums + c;
+            for (uint32_t c = 0; c < columns; ++c) {
+                size_t indx = r * columns + c;
 
                 float cls = cls_ptr[indx];
                 if (cls < score_tresh_sq) continue;
@@ -913,23 +903,25 @@ static void decode_yunet(const NetworkOutputs *outs, FaceVector *faces,
         }
     }
 }
-//calculate how much lider's bounding box is in this b bounding box if more than treshold it is removed, if not it is other face
+
+// ============> NMS - leave only real faces with highest possibility <========
+//calculate how much lider's bounding box is in this b bounding box if more than threshold it is removed, if not it is other face
 static float calculate_iou(const Face *a, const Face *b) {
-    //get union ara
-    float x1 = (a->x > b->x) ? a->x : b->x;
-    float y1 = (a->y > b->y) ? a->y : b->y;
-    float x2 = ((a->x + a->w) < (b->x + b->w)) ? (a->x + a->w) : (b->x + b->w);
-    float y2 = ((a->y + a->h) < (b->y + b->h)) ? (a->y + a->h) : (b->y + b->h);
-    float inter_w = x2 - x1;
-    float inter_h = y2 - y1;
+    // get union area of 2 possible faces
+    const float x1 = a->x > b->x ? a->x : b->x;
+    const float y1 = a->y > b->y ? a->y : b->y;
+    const float x2 = a->x + a->w < b->x + b->w ? a->x + a->w : b->x + b->w;
+    const float y2 = a->y + a->h < b->y + b->h ? a->y + a->h : b->y + b->h;
+    const float inter_w = x2 - x1;
+    const float inter_h = y2 - y1;
     if (inter_w <= 0.0f || inter_h <= 0.0f) return 0.0f;
 
-    float inter_area = inter_w * inter_h;
-    float union_area = (a->w * a->h) + (b->w * b->h) - inter_area;
+    const float inter_area = inter_w * inter_h;
+    const float union_area = a->w * a->h + b->w * b->h - inter_area;
 
-    return (union_area > 0.0f) ? (inter_area / union_area) : 0.0f;
-
+    return union_area > 0.0f ? inter_area / union_area : 0.0f;
 }
+
 static int compare_faces_desc(const void *a, const void *b) {
     const Face *fa = (const Face *) a;
     const Face *fb = (const Face *) b;
@@ -937,7 +929,8 @@ static int compare_faces_desc(const void *a, const void *b) {
     if (fb->confidence < fa->confidence) return -1;
     return 0;
 }
-void nms(FaceVector *faces_vector, float nms_thresh) {
+
+static void nms(FaceVector *faces_vector, const float nms_thresh) {
     if (faces_vector->size <= 1) return;
     qsort(faces_vector->faces, faces_vector->size, sizeof(Face), compare_faces_desc);
 
@@ -945,7 +938,6 @@ void nms(FaceVector *faces_vector, float nms_thresh) {
         if (faces_vector->faces[i].isRemoved) continue;
         for (size_t j = i + 1; j < faces_vector->size; ++j) {
             if (faces_vector->faces[j].isRemoved) continue;
-
             if (calculate_iou(&faces_vector->faces[i], &faces_vector->faces[j]) > nms_thresh) {
                 faces_vector->faces[j].isRemoved = true;
 
@@ -964,7 +956,122 @@ void nms(FaceVector *faces_vector, float nms_thresh) {
     }
     faces_vector->size = write_idx;
 }
-Tensor load_image_as_tensor(const char *filepath, uint32_t target_w, uint32_t target_h) {
+
+// =============> Face Alignment - Kabsh-Umeyama Algorith <===============
+static const float REFERENCE_FACIAL_POINTS[5][2] = {
+    {38.2946f, 51.6963f}, // left eye
+    {73.5318f, 51.6963f}, // right eye
+    {55.9020f, 71.7366f}, // nose
+    {41.5493f, 92.3655f}, // left mouth
+    {70.7299f, 92.3655f}  // right mouth
+};
+typedef struct {
+    float m[2][3];
+} AffineMatrix_2x3;
+
+static AffineMatrix_2x3 calculate_affine_matrix(float src_landmarks[10]) {
+    // calculate centroids
+    float src_mean_x = 0.0f, src_mean_y = 0.0f;
+    float dst_mean_x = 0.0f, dst_mean_y = 0.0f;
+    for (int i=0; i<5; ++i) {
+        src_mean_x += src_landmarks[i * 2 + 0];
+        src_mean_y += src_landmarks[i * 2 + 1];
+        dst_mean_x += REFERENCE_FACIAL_POINTS[i][0];
+        dst_mean_y += REFERENCE_FACIAL_POINTS[i][1];
+    }
+    src_mean_x /= 5.0f; src_mean_y /= 5.0f;
+    dst_mean_x /= 5.0f; dst_mean_y /= 5.0f;
+
+    // Variance and cross-Variance
+    float var_x = 0.0f; // source variance
+    float A_dot = 0.0f; // scalar of source and dest
+    float B_dot = 0.0f; // vector of source and dest
+
+    for (int i = 0; i < 5; ++i) {
+        const float sx = src_landmarks[i * 2 + 0] - src_mean_x;
+        const float sy = src_landmarks[i * 2 + 1] - src_mean_y;
+        const float dx = REFERENCE_FACIAL_POINTS[i][0] - dst_mean_x;
+        const float dy = REFERENCE_FACIAL_POINTS[i][1] - dst_mean_y;
+
+        var_x += sx * sx + sy * sy;
+        A_dot += dx * sx + dy * sy;
+        B_dot += dy * sx - dx * sy;
+    }
+    if (var_x < 1e-6f) var_x = 1e-6f;
+
+    const float a = A_dot / var_x;
+    const float b = B_dot / var_x;
+    const float tx = dst_mean_x - (a * src_mean_x - b * src_mean_y);
+    const float ty = dst_mean_y - (b * src_mean_x + a * src_mean_y);
+
+    AffineMatrix_2x3 M;
+    M.m[0][0] = a;  M.m[0][1] = -b; M.m[0][2] = tx;
+    M.m[1][0] = b;  M.m[1][1] = a;  M.m[1][2] = ty;
+    return M;
+}
+// Warp Affine
+static Tensor align_crop_face(const unsigned char *src_img, int img_w, int img_h, float src_landmarks[10]) {
+    //create input tensor for sFace
+    constexpr uint32_t out_w = 112;
+    constexpr uint32_t out_h = 112;
+    const Tensor aligned = create_Tensor(1, 3, out_h, out_w);
+    constexpr size_t plane_size = (size_t)out_h * out_w;
+    // M = |a -b tx|
+    //     |b  a ty|
+    const AffineMatrix_2x3 M = calculate_affine_matrix(src_landmarks);
+    const float a = M.m[0][0];
+    const float b = M.m[1][0];
+    const float tx = M.m[0][2];
+    const float ty = M.m[1][2];
+    //calculate determinant
+    float det = a * a + b * b;
+    if (det < 1e-8f) det = 1e-8f;
+    // u = a*x - b*y + tx   v = b*x - a*x + ty
+    // we know u and v so we want to get x and y
+    // x = (a * (u -tx) + b * (v-ty))/det   y = (-b * (u -tx) + a * (v -ty)) / det
+    for (uint32_t v = 0; v < out_h; ++v) {
+        for (uint32_t u = 0; u < out_w; ++u) {
+            //inverse mapping [u,v] = [src_x,src_y]
+            const float src_x = (a * (u -tx) + b * (v-ty))/det;
+            const float src_y = (-b * (u -tx) + a * (v -ty)) / det;
+
+            const int x0 = (int)floorf(src_x);
+            const int y0 = (int)floorf(src_y);
+            const int x1 = x0 + 1;
+            const int y1 = y0 + 1;
+
+            const float fx = src_x - (float)x0;
+            const float fy = src_y - (float)y0;
+
+            float r = 0.0f, g = 0.0f, bl = 0.0f;
+
+            if (x0 >= 0 && x1 < img_w && y0 >= 0 && y1 < img_h) {
+                const float w00 = (1.0f - fx) * (1.0f - fy);
+                const float w10 = fx * (1.0f - fy);
+                const float w01 = (1.0f - fx) * fy;
+                const float w11 = fx * fy;
+
+                const int idx00 = (y0 * img_w + x0) * 3;
+                const int idx10 = (y0 * img_w + x1) * 3;
+                const int idx01 = (y1 * img_w + x0) * 3;
+                const int idx11 = (y1 * img_w + x1) * 3;
+
+                r  = w00 * src_img[idx00 + 0] + w10 * src_img[idx10 + 0] + w01 * src_img[idx01 + 0] + w11 * src_img[idx11 + 0];
+                g  = w00 * src_img[idx00 + 1] + w10 * src_img[idx10 + 1] + w01 * src_img[idx01 + 1] + w11 * src_img[idx11 + 1];
+                bl = w00 * src_img[idx00 + 2] + w10 * src_img[idx10 + 2] + w01 * src_img[idx01 + 2] + w11 * src_img[idx11 + 2];
+            }
+
+            const size_t out_idx = v * out_w + u;
+
+            aligned.data[0 * plane_size + out_idx] = bl;
+            aligned.data[1 * plane_size + out_idx] = g;
+            aligned.data[2 * plane_size + out_idx] = r;
+        }
+    }
+    return aligned;
+}
+
+static Tensor load_image_as_tensor(const char *filepath, const uint32_t target_w, const uint32_t target_h) {
     int img_w, img_h, channels;
     // load RGB
     unsigned char *raw_data = stbi_load(filepath, &img_w, &img_h, &channels, 3);
@@ -999,8 +1106,8 @@ Tensor load_image_as_tensor(const char *filepath, uint32_t target_w, uint32_t ta
     return resized;
 }
 
-static void draw_point(unsigned char *img, int img_w, int img_h, int cx, int cy, int radius, unsigned char r,
-                       unsigned char g, unsigned char b) {
+static void draw_point(unsigned char *img, const int img_w, const int img_h, const int cx, const int cy, const int radius, const unsigned char r,
+                       const unsigned char g, const unsigned char b) {
     for (int dy = -radius; dy <= radius; ++dy) {
         for (int dx = -radius; dx <= radius; ++dx) {
             if (dx * dx + dy * dy <= radius * radius) {
@@ -1031,26 +1138,26 @@ static void draw_detections(const char *image_path, const FaceVector *faces, con
         return;
     }
 
-    float scale_x = (float) w / 640.0f;
-    float scale_y = (float) h / 640.0f;
+    const float scale_x = (float) w / 640.0f;
+    const float scale_y = (float) h / 640.0f;
 
     for (size_t i = 0; i < faces->size; ++i) {
-        Face *f = &faces->faces[i];
+        const Face *f = &faces->faces[i];
 
-        int rx = (int) (f->x * scale_x);
-        int ry = (int) (f->y * scale_y);
-        int rw = (int) (f->w * scale_x);
-        int rh = (int) (f->h * scale_y);
+        const int rx = (int) (f->x * scale_x);
+        const int ry = (int) (f->y * scale_y);
+        const int rw = (int) (f->w * scale_x);
+        const int rh = (int) (f->h * scale_y);
 
-        int x_min = (rx < 0) ? 0 : rx;
-        int y_min = (ry < 0) ? 0 : ry;
-        int x_max = (rx + rw >= w) ? w - 1 : rx + rw;
-        int y_max = (ry + rh >= h) ? h - 1 : ry + rh;
+        const int x_min = (rx < 0) ? 0 : rx;
+        const int y_min = (ry < 0) ? 0 : ry;
+        const int x_max = (rx + rw >= w) ? w - 1 : rx + rw;
+        const int y_max = (ry + rh >= h) ? h - 1 : ry + rh;
 
         // DRAW BOX
-        int thickness = 3;
         for (int y = y_min; y <= y_max; ++y) {
             for (int x = x_min; x <= x_max; ++x) {
+                constexpr int thickness = 3;
                 if (x < rx + thickness || x > rx + rw - thickness ||
                     y < ry + thickness || y > ry + rh - thickness) {
                     int idx = (y * w + x) * 3;
@@ -1061,17 +1168,16 @@ static void draw_detections(const char *image_path, const FaceVector *faces, con
             }
         }
 
-        unsigned char colors[5][3] = {
-            {255, 0, 0},
-            {255, 0, 0},
-            {0, 120, 255},
-            {255, 255, 0},
-            {255, 255, 0}
-        };
-
         for (int k = 0; k < 5; ++k) {
-            int lx = (int) (f->landmarks[k * 2 + 0] * scale_x);
-            int ly = (int) (f->landmarks[k * 2 + 1] * scale_y);
+            const unsigned char colors[5][3] = {
+                {255, 0, 0},
+                {255, 0, 0},
+                {0, 120, 255},
+                {255, 255, 0},
+                {255, 255, 0}
+            };
+            const int lx = (int) (f->landmarks[k * 2 + 0] * scale_x);
+            const int ly = (int) (f->landmarks[k * 2 + 1] * scale_y);
             draw_point(img, w, h, lx, ly, 4, colors[k][0], colors[k][1], colors[k][2]);
         }
     }
@@ -1080,38 +1186,67 @@ static void draw_detections(const char *image_path, const FaceVector *faces, con
     printf("[+] Successfully saved annotated image to: %s\n", output_path);
     stbi_image_free(img);
 }
+static void save_tensor_to_png(const Tensor *t, const char *filepath) {
+    const uint32_t w = t->width;
+    const uint32_t h = t->height;
+    const size_t plane_size = (size_t)w * h;
 
+    unsigned char *rgb_buf = (unsigned char *)malloc(plane_size * 3);
+    if (!rgb_buf) {
+        fprintf(stderr, "ERROR: Cannot allocate buffer for PNG export!\n");
+        return;
+    }
 
+    for (size_t i = 0; i < plane_size; ++i) {
+        const float b = t->data[0 * plane_size + i];
+        const float g = t->data[1 * plane_size + i];
+        const float r = t->data[2 * plane_size + i];
+
+        rgb_buf[i * 3 + 0] = (unsigned char)(r < 0.0f ? 0 : (r > 255.0f ? 255 : (int)roundf(r)));
+        rgb_buf[i * 3 + 1] = (unsigned char)(g < 0.0f ? 0 : (g > 255.0f ? 255 : (int)roundf(g)));
+        rgb_buf[i * 3 + 2] = (unsigned char)(b < 0.0f ? 0 : (b > 255.0f ? 255 : (int)roundf(b)));
+    }
+
+    if (stbi_write_png(filepath, (int)w, (int)h, 3, rgb_buf, (int)w * 3)) {
+        printf("[+] Successfully saved aligned face crop: '%s'\n", filepath);
+    } else {
+        char fallback[512];
+        snprintf(fallback, sizeof(fallback), "../%s", filepath);
+        if (stbi_write_png(fallback, (int)w, (int)h, 3, rgb_buf, (int)w * 3)) {
+            printf("[+] Successfully saved aligned face crop (fallback): '%s'\n", fallback);
+        } else {
+            fprintf(stderr, "ERROR: Failed to save aligned face PNG to '%s'\n", filepath);
+        }
+    }
+    free(rgb_buf);
+}
+// input picture -> network forward (yunet)-> decoding -> nms -> face alignment
 int main() {
     const uint32_t total_cores = omp_get_num_procs();
-    //we will use total cores - 1
     const uint32_t threads_available = (total_cores > 1) ? (total_cores - 1) : 1;
     omp_set_num_threads(threads_available);
-    printf("[*] Detected %d CPU cores. Using %d threads for inference (1 left for OS).\n", total_cores,
-           threads_available);
+    printf("[*] Detected %d CPU cores. Using %d threads for inference (1 left for OS).\n",
+           total_cores, threads_available);
 
     printf("[*] Loading network...\n");
     Network net = load_network("models/yunet.cfg", "models/yunet_weights");
     printf("[+] Network loaded successfully! Num layers: %zu\n", net.num_layers);
 
-    printf("[*] Loading image to tensor...\n");
-    Tensor input = load_image_as_tensor("robert.jpg", 640, 640);
+    const char *img_path = "../dataset/raw/roberto.jpg";
+
+    printf("[*] Loading image to tensor for YuNet (640x640)...\n");
+    Tensor input = load_image_as_tensor(img_path, 640, 640);
 
     printf("[*] Running forward pass...\n");
     NetworkOutputs outs = forward_network(&net, &input);
     printf("[+] Forward pass completed! Output count: %zu\n", outs.count);
 
-    for (size_t i = 0; i < outs.count; ++i) {
-        Tensor *t = &outs.outputs[i].tensor;
-        printf("    -> Output [%zu]: '%s' shape: [%u, %u, %u, %u], first val: %.4f\n",
-               i, outs.outputs[i].name, t->batch, t->channel, t->height, t->width, t->data[0]);
-    }
     FaceVector faces;
     face_vec_init(&faces, 32);
 
     decode_yunet(&outs, &faces, 640, 640, 0.6f);
-
     printf("[+] Decoded %zu candidate faces (before NMS)\n", faces.size);
+
     nms(&faces, 0.3f);
     printf("[+] Detected %zu faces after NMS!\n", faces.size);
 
@@ -1123,11 +1258,45 @@ int main() {
                f->landmarks[0], f->landmarks[1], f->landmarks[2], f->landmarks[3], f->landmarks[4], f->landmarks[5]);
     }
 
-    draw_detections("robert.jpg", &faces, "test_output.png");
+    int orig_w = 0, orig_h = 0, orig_ch = 0;
+    unsigned char *raw_orig = stbi_load(img_path, &orig_w, &orig_h, &orig_ch, 3);
+    if (!raw_orig) {
+        char fallback[512];
+        snprintf(fallback, sizeof(fallback), "../%s", img_path);
+        raw_orig = stbi_load(fallback, &orig_w, &orig_h, &orig_ch, 3);
+    }
+    if (!raw_orig) {
+        fprintf(stderr, "ERROR: Cannot open raw image '%s' for alignment!\n", img_path);
+        exit(1);
+    }
+
+    const float scale_x = (float)orig_w / 640.0f;
+    const float scale_y = (float)orig_h / 640.0f;
+
+    for (size_t i = 0; i < faces.size; ++i) {
+        const Face *f = &faces.faces[i];
+
+        float scaled_landmarks[10];
+        for (int k = 0; k < 5; ++k) {
+            scaled_landmarks[k * 2 + 0] = f->landmarks[k * 2 + 0] * scale_x;
+            scaled_landmarks[k * 2 + 1] = f->landmarks[k * 2 + 1] * scale_y;
+        }
+
+        // Warp Affine (Umeyama) -> Tensor 1x3x112x112 (BGR)
+        Tensor aligned_face = align_crop_face(raw_orig, orig_w, orig_h, scaled_landmarks);
+
+        char crop_path[256];
+        snprintf(crop_path, sizeof(crop_path), "../dataset/raw/aligned_roberto_%zu.png", i);
+        save_tensor_to_png(&aligned_face, crop_path);
+        free_tensor(&aligned_face);
+    }
+    draw_detections(img_path, &faces, "../dataset/raw/test_output.png");
+    stbi_image_free(raw_orig);
     face_vec_free(&faces);
     free_tensor(&input);
     free_network_outputs(&outs);
     free_network(&net);
+
     printf("[+] Cleaned up memory. All good!\n");
     return 0;
 }
