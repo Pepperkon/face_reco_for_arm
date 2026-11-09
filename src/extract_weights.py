@@ -31,5 +31,8 @@ def extract_weights(onnx_path, out_dir):
 if __name__ == '__main__':
     yunet_onnx = "../models/face_detection_yunet_2023mar.onnx"
     out_dir = "../models/yunet_weights"
+    sFace_onnx  = "../models/face_recognition_sface_2021dec.onnx"
+    sFace_out = "../models/sface_weights"
 
     extract_weights(yunet_onnx, out_dir)
+    extract_weights(sFace_onnx,sFace_out)
