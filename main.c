@@ -966,10 +966,10 @@ static void decode_yunet(const NetworkOutputs *outs, FaceVector *faces,
         snprintf(kps_name, sizeof(kps_name), "kps_%u", stride);
 
         //GET OUTPUT FOR EVERY STRIDE
-        Tensor *cls_t = find_output_tensor(outs, cls_name);
-        Tensor *obj_t = find_output_tensor(outs, obj_name);
-        Tensor *bbox_t = find_output_tensor(outs, bbox_name);
-        Tensor *kps_t = find_output_tensor(outs, kps_name);
+        const Tensor *cls_t = find_output_tensor(outs, cls_name);
+        const Tensor *obj_t = find_output_tensor(outs, obj_name);
+        const Tensor *bbox_t = find_output_tensor(outs, bbox_name);
+        const Tensor *kps_t = find_output_tensor(outs, kps_name);
 
         if (!cls_t || !obj_t || !bbox_t || !kps_t) {
             fprintf(stderr, "WARNING: Missing heads for stride %u\n", stride);
