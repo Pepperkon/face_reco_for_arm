@@ -966,10 +966,10 @@ static void decode_yunet(const NetworkOutputs *outs, FaceVector *faces,
         snprintf(kps_name, sizeof(kps_name), "kps_%u", stride);
 
         //GET OUTPUT FOR EVERY STRIDE
-        Tensor *cls_t = find_output_tensor(outs, cls_name);
-        Tensor *obj_t = find_output_tensor(outs, obj_name);
-        Tensor *bbox_t = find_output_tensor(outs, bbox_name);
-        Tensor *kps_t = find_output_tensor(outs, kps_name);
+        const Tensor *cls_t = find_output_tensor(outs, cls_name);
+        const Tensor *obj_t = find_output_tensor(outs, obj_name);
+        const Tensor *bbox_t = find_output_tensor(outs, bbox_name);
+        const Tensor *kps_t = find_output_tensor(outs, kps_name);
 
         if (!cls_t || !obj_t || !bbox_t || !kps_t) {
             fprintf(stderr, "WARNING: Missing heads for stride %u\n", stride);
@@ -1414,7 +1414,7 @@ static bool extract_face_feature(const Network *sface_net, const Tensor *aligned
         printf("[+] SFace zaladowany! Liczba warstw: %zu\n", sface.num_layers);
 
 
-        const char *baseline_path = "../dataset/raw/roberto.jpg";
+        const char *baseline_path = "dataset/raw/roberto.jpg";
         printf("\n[*] === REJESTRACJA WZORCA: %s ===\n", baseline_path);
 
         int base_w = 0, base_h = 0, base_ch = 0;
@@ -1466,7 +1466,7 @@ static bool extract_face_feature(const Network *sface_net, const Tensor *aligned
         stbi_image_free(base_raw);
 
 
-        const char *test_path = "../dataset/raw/roberto3.jpg";
+        const char *test_path = "dataset/raw/roberto3.jpg";
         printf("\n[*] === TEST ROZPOZNAWANIA: %s ===\n", test_path);
 
         int test_w = 0, test_h = 0, test_ch = 0;
@@ -1521,7 +1521,7 @@ static bool extract_face_feature(const Network *sface_net, const Tensor *aligned
             }
         }
 
-        draw_detections(test_path, &test_faces, "../dataset/raw/recognition_result.png");
+        draw_detections(test_path, &test_faces, "dataset/raw/recognition_result.png");
 
         stbi_image_free(test_raw);
         face_vec_free(&test_faces);
