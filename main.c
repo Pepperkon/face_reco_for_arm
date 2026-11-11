@@ -1414,7 +1414,7 @@ static bool extract_face_feature(const Network *sface_net, const Tensor *aligned
         printf("[+] SFace zaladowany! Liczba warstw: %zu\n", sface.num_layers);
 
 
-        const char *baseline_path = "../dataset/raw/roberto.jpg";
+        const char *baseline_path = "dataset/raw/roberto.jpg";
         printf("\n[*] === REJESTRACJA WZORCA: %s ===\n", baseline_path);
 
         int base_w = 0, base_h = 0, base_ch = 0;
@@ -1466,7 +1466,7 @@ static bool extract_face_feature(const Network *sface_net, const Tensor *aligned
         stbi_image_free(base_raw);
 
 
-        const char *test_path = "../dataset/raw/roberto3.jpg";
+        const char *test_path = "dataset/raw/roberto3.jpg";
         printf("\n[*] === TEST ROZPOZNAWANIA: %s ===\n", test_path);
 
         int test_w = 0, test_h = 0, test_ch = 0;
@@ -1521,7 +1521,7 @@ static bool extract_face_feature(const Network *sface_net, const Tensor *aligned
             }
         }
 
-        draw_detections(test_path, &test_faces, "../dataset/raw/recognition_result.png");
+        draw_detections(test_path, &test_faces, "dataset/raw/recognition_result.png");
 
         stbi_image_free(test_raw);
         face_vec_free(&test_faces);
