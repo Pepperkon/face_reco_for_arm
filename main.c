@@ -3,12 +3,20 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
-#include <math.h> //using it now but might implement my own in near future
+#include <math.h>
 #include <omp.h>
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
+
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    #include <arm_neon.h>
+    #define USE_NEON_OPTIMIZATION 1
+#elif defined(_M_X64) || defined(__x86_64__)
+    #define USE_NEON_OPTIMIZATION 0
+
+#endif
 #include <stdbool.h>
 #ifndef nullptr
 #define nullptr NULL
@@ -89,7 +97,6 @@ static void vec_free(Float_vector *v) {
     v->size = 0;
     v->capacity = 0;
 }
-
 // ===================================
 
 // ============> TENSOR <=============
@@ -137,10 +144,13 @@ static void free_tensor(Tensor *t) {
     }
     t->batch = t->channel = t->height = t->width = 0;
 }
-
 // ===============================
 
-// ===================> LAYER TYPES <==========================
+
+
+
+
+// ===================> LAYERS <==========================
 
 // ===========> RELU <============
 // lets do this in place
@@ -269,7 +279,7 @@ static Tensor maxPool(const Tensor *t, uint32_t pool_size, uint32_t stride) {
 // ===============================
 
 // ==========> RESIZE <===========
-// yunet resize is asymmetric and algorithm is nearest neigbour with floor variant so first we make new tensor,
+// yunet resize is asymmetric and algorithm is nearest neighbour with floor variant so first we make new tensor,
 // and for every pixel we do simple operation old_tensor_id = floor(new_tensor_index/ scale)
 // resize for channel and batches are left 1:1 hopefully...
 // ===============================
@@ -304,14 +314,14 @@ static Tensor resize_nn_asymmetric(const Tensor *t, const uint32_t new_width, co
 // ===============================
 
 // ===========> PRelu <===========
-static Tensor PRelu(Tensor *t, const Float_vector* slope ) {
+static Tensor PRelu(Tensor *t, const Float_vector *slope) {
     const size_t planeSize = t->height * t->width;
     for (uint32_t b = 0; b < t->batch; ++b) {
         for (uint32_t c = 0; c < t->channel; ++c) {
             float s = slope->data[c];
             float *ptr = t->data + (b * t->channel + c) * planeSize;
             for (size_t i = 0; i < planeSize; ++i) {
-                if (ptr[i]<0.0f) ptr[i] *= s;
+                if (ptr[i] < 0.0f) ptr[i] *= s;
             }
         }
     }
@@ -320,20 +330,21 @@ static Tensor PRelu(Tensor *t, const Float_vector* slope ) {
     t->batch = t->channel = t->height = t->width = 0;
     return res;
 }
+
 // ===============================
 // ========> GEMM <==============
 // GEMM: out[i] = bias[i] + sum_j(weight[i*in + j] * input[j])
 // weight shape: [out_features, in_features], np. [128, 50176]
-static Tensor GEMM(const Tensor *t, const Tensor *weight, const Float_vector *bias ) {
+static Tensor GEMM(const Tensor *t, const Tensor *weight, const Float_vector *bias) {
     const uint32_t out_features = weight->batch;
     const uint32_t in_features = weight->channel;
     Tensor res = create_Tensor(1, out_features, 1, 1);
 #pragma omp parallel for
-    for (uint32_t i = 0; i<out_features; ++i) {
-        const float* w_row = weight->data + i*in_features;
+    for (uint32_t i = 0; i < out_features; ++i) {
+        const float *w_row = weight->data + i * in_features;
         float sum = bias && bias->data ? bias->data[i] : 0.0f;
-        for (uint32_t j = 0; j<in_features; ++j) {
-            sum += w_row[j]*t->data[j];
+        for (uint32_t j = 0; j < in_features; ++j) {
+            sum += w_row[j] * t->data[j];
         }
         res.data[i] = sum;
     }
@@ -344,109 +355,83 @@ static Tensor GEMM(const Tensor *t, const Tensor *weight, const Float_vector *bi
 // =======> Flatten <=============
 // N,C,H,W -> N, C*H*W, 1, 1
 static Tensor flatten(Tensor *t) {
-    const uint32_t flat_size = t->channel*t->height*t->width;
+    const uint32_t flat_size = t->channel * t->height * t->width;
     Tensor res;
     res.batch = t->batch;
     res.channel = flat_size;
     res.height = 1;
     res.width = 1;
-    res.data=t->data;
+    res.data = t->data;
     t->data = nullptr;
     t->batch = t->channel = t->height = t->width = 0;
     return res;
 }
+
 // ===============================
 
 // =========> subtract Scalar <==========
 static Tensor sub_scalar(Tensor *t, const float sub) {
     const size_t total_elements = (size_t) t->batch * t->channel * t->height * t->width;
     for (size_t i = 0; i < total_elements; ++i) {
-        t->data[i]-=sub;
+        t->data[i] -= sub;
     }
     const Tensor res = *t;
     t->data = nullptr;
     t->batch = t->channel = t->height = t->width = 0;
     return res;
 }
+
 // ===============================
 
 // ========> multiply scalar <===========
-static Tensor mul_scalar(Tensor *t,const float mul) {
+static Tensor mul_scalar(Tensor *t, const float mul) {
     const size_t total_elements = (size_t) t->batch * t->channel * t->height * t->width;
     for (size_t i = 0; i < total_elements; ++i) {
-        t->data[i]*=mul;
+        t->data[i] *= mul;
     }
     const Tensor res = *t;
     t->data = nullptr;
     t->batch = t->channel = t->height = t->width = 0;
     return res;
 }
+
 // ===============================
 
 // ==========> CONV <=============
-//classical conv
-// out size formula is same for height and width O= floor((I-K+2P)/S) + 1, where I is input size, K is kernel size,
-// p is padding and S is Stride
-//  filter tensor params are [C_out, C_in, K_h, K_w] - c_out is number of channels on out tensor and C_in is channels _in
-static Tensor conv(const Tensor *input, const Tensor *filter_tensor, const Float_vector *bias, const uint32_t stride,
-                   const uint32_t padding, bool apply_relu) {
-    //more clean names
+
+static Tensor conv_1x1_x86(const Tensor *input, const Tensor *filter_tensor, const Float_vector *bias,
+    const uint32_t stride, bool apply_relu) {
     const uint32_t out_channels = filter_tensor->batch; // number of filters
     const uint32_t in_channels = filter_tensor->channel; // filter Z coordinate
-    const uint32_t kernel_h = filter_tensor->height; // filter Y coordinate
-    const uint32_t kernel_w = filter_tensor->width; // filter X coordinate
-
     if (input->channel != in_channels) {
-        fprintf(stderr, "CRITICAL ERROR: Input channels (%u) do not match weight in_channels (%u)!\n", input->channel,
-                in_channels);
+        fprintf(stderr, "CRITICAL ERROR: 1x1 conv channel mismatch (%u vs %u)\n", input->channel, in_channels);
         exit(1);
     }
-
-    const uint32_t out_h = (input->height - kernel_h + 2 * padding) / stride + 1;
-    const uint32_t out_w = (input->width - kernel_w + 2 * padding) / stride + 1;
+    const uint32_t out_h = (input->height - 1) / stride + 1;
+    const uint32_t out_w = (input->width - 1) / stride + 1;
     const Tensor out = create_Tensor(input->batch, out_channels, out_h, out_w);
 
     const size_t out_channel_size = (size_t) out_h * out_w;
     const size_t input_channel_size = input->height * input->width;
 
     for (uint32_t b = 0; b < input->batch; ++b) {
+        const float *in_b = input->data + b * in_channels * input_channel_size;
 #pragma omp parallel for
         for (uint32_t c = 0; c < out_channels; ++c) {
             float *out_c_pointer = out.data + b * out_channels * out_channel_size + c * out_channel_size;
             const float bias_val = bias != NULL && bias->size > c ? bias->data[c] : 0.0f;
-            const float *filter_pointer = filter_tensor->data + c * in_channels * kernel_h * kernel_w;
-
+            const float *filter_pointer = filter_tensor->data + c * in_channels;
             for (uint32_t y = 0; y < out_h; ++y) {
                 for (uint32_t x = 0; x < out_w; ++x) {
                     float sum = bias_val;
-                    const float *weight_pointer = filter_pointer;
-                    // we go through every filter tensor and tensor has parameters [ic,kh,kw] b in filter tensor is numvber of tensors
-                    for (uint32_t ic = 0; ic < in_channels; ++ic) {
-                        const float *input_channel_ptr =
-                                input->data + b * in_channels * input_channel_size + (ic * input_channel_size);
-                        for (uint32_t ky = 0; ky < kernel_h; ++ky) {
-                            //if padding we skip (do not bother multiplying with 0)
-                            const int32_t in_y = (y * stride) + ky - padding;
-                            if (in_y < 0 || in_y >= (int32_t) input->height) {
-                                weight_pointer += kernel_w;
-                                continue;
-                            }
-                            for (uint32_t kx = 0; kx < kernel_w; ++kx) {
-                                const int32_t in_x = (x * stride) + kx - padding;
-                                //check if it is not padding (zeros)
-                                if (in_x >= 0 && in_x < (int32_t) input->width) {
-                                    const size_t in_idx = in_y * input->width + in_x;
-                                    sum += input_channel_ptr[in_idx] * *weight_pointer;
-                                }
-                                weight_pointer++;
-                            }
-                        }
+                    //pointer to value from input tensor
+                    size_t p = (size_t)  y*stride * input->width + x*stride;
+                    //go through every channel from input tensor
+                    for (uint32_t ci = 0; ci < in_channels; ++ci) {
+                        sum += filter_pointer[ci]* in_b[ci*input_channel_size + p];
                     }
-                    if (apply_relu && sum < 0.0f) {
-                        sum = 0.0f;
-                    }
-                    *out_c_pointer = sum;
-                    out_c_pointer++;
+                    if (apply_relu && sum < 0.0f) sum = 0.0f;
+                    out_c_pointer[y * out_w + x] = sum;
                 }
             }
         }
@@ -454,6 +439,104 @@ static Tensor conv(const Tensor *input, const Tensor *filter_tensor, const Float
     return out;
 }
 
+static Tensor conv_1x1_arm_neon(const Tensor *input, const Tensor *filter_tensor, const Float_vector *bias,
+    const uint32_t stride, const bool apply_relu) {
+    const uint32_t out_channels = filter_tensor->batch; // number of filters
+    const uint32_t in_channels = filter_tensor->channel; // filter Z coordinate
+    if (input->channel != in_channels) {
+        fprintf(stderr, "CRITICAL ERROR: 1x1 conv channel mismatch (%u vs %u)\n", input->channel, in_channels);
+        exit(1);
+    }
+
+    const uint32_t out_h = (input->height - 1) / stride + 1;
+    const uint32_t out_w = (input->width - 1) / stride + 1;
+    const Tensor out = create_Tensor(input->batch, out_channels, out_h, out_w);
+    const size_t out_channel_size = (size_t) out_h * out_w;
+    const size_t input_channel_size = input->height * input->width;
+    const uint32_t n_blocks = (out_channels+3)/4;
+
+    for (uint32_t b = 0; b < n_blocks; ++b) {
+        const float *in_b = input->data + b * in_channels * input_channel_size;
+        float *out_b = out.data + b * out_channels * out_channel_size;
+#pragma omp parallel for schedule(static)
+        for (uint32_t block = 0; block < n_blocks; ++block) {
+
+        }
+    }
+}
+    // classical conv
+    // out size formula is same for height and width O= floor((I-K+2P)/S) + 1, where I is input size, K is kernel size,
+    // p is padding and S is Stride
+    // filter tensor params are [C_out, C_in, K_h, K_w] - c_out is number of channels on out tensor and C_in is channels _in
+    static Tensor conv(const Tensor *input, const Tensor *filter_tensor, const Float_vector *bias, const uint32_t stride,
+                       const uint32_t padding, bool apply_relu) {
+        if (filter_tensor->width == 1 && filter_tensor->height == 1) {
+            if (!USE_NEON_OPTIMIZATION) return conv_1x1_x86(input,filter_tensor,bias,stride,apply_relu);
+            return conv_1x1_arm_neon(input,filter_tensor,bias,stride,apply_relu);
+        }
+        //more clean names
+        const uint32_t out_channels = filter_tensor->batch; // number of filters
+        const uint32_t in_channels = filter_tensor->channel; // filter Z coordinate
+        const uint32_t kernel_h = filter_tensor->height; // filter Y coordinate
+        const uint32_t kernel_w = filter_tensor->width; // filter X coordinate
+
+        if (input->channel != in_channels) {
+            fprintf(stderr, "CRITICAL ERROR: Input channels (%u) do not match weight in_channels (%u)!\n", input->channel,
+                    in_channels);
+            exit(1);
+        }
+
+        const uint32_t out_h = (input->height - kernel_h + 2 * padding) / stride + 1;
+        const uint32_t out_w = (input->width - kernel_w + 2 * padding) / stride + 1;
+        const Tensor out = create_Tensor(input->batch, out_channels, out_h, out_w);
+
+        const size_t out_channel_size = (size_t) out_h * out_w;
+        const size_t input_channel_size = input->height * input->width;
+
+        for (uint32_t b = 0; b < input->batch; ++b) {
+#pragma omp parallel for
+            for (uint32_t c = 0; c < out_channels; ++c) {
+                float *out_c_pointer = out.data + b * out_channels * out_channel_size + c * out_channel_size;
+                const float bias_val = bias != NULL && bias->size > c ? bias->data[c] : 0.0f;
+                const float *filter_pointer = filter_tensor->data + c * in_channels * kernel_h * kernel_w;
+
+                for (uint32_t y = 0; y < out_h; ++y) {
+                    for (uint32_t x = 0; x < out_w; ++x) {
+                        float sum = bias_val;
+                        const float *weight_pointer = filter_pointer;
+                        // we go through every filter tensor and tensor has parameters [ic,kh,kw] b in filter tensor is number of tensors
+                        for (uint32_t ic = 0; ic < in_channels; ++ic) {
+                            const float *input_channel_ptr =
+                                    input->data + b * in_channels * input_channel_size + (ic * input_channel_size);
+                            for (uint32_t ky = 0; ky < kernel_h; ++ky) {
+                                //if padding we skip (do not bother multiplying with 0)
+                                const int32_t in_y = (y * stride) + ky - padding;
+                                if (in_y < 0 || in_y >= (int32_t) input->height) {
+                                    weight_pointer += kernel_w;
+                                    continue;
+                                }
+                                for (uint32_t kx = 0; kx < kernel_w; ++kx) {
+                                    const int32_t in_x = (x * stride) + kx - padding;
+                                    //check if it is not padding (zeros)
+                                    if (in_x >= 0 && in_x < (int32_t) input->width) {
+                                        const size_t in_idx = in_y * input->width + in_x;
+                                        sum += input_channel_ptr[in_idx] * *weight_pointer;
+                                    }
+                                    weight_pointer++;
+                                }
+                            }
+                        }
+                        if (apply_relu && sum < 0.0f) {
+                            sum = 0.0f;
+                        }
+                        *out_c_pointer = sum;
+                        out_c_pointer++;
+                    }
+                }
+            }
+        }
+        return out;
+    }
 // ===============================
 
 // =======> DepthWise Conv <======
@@ -522,7 +605,6 @@ static Tensor depthwise_conv2D(const Tensor *input, const Tensor *filter_tensor,
     }
     return out;
 }
-
 // ===============================
 
 
@@ -611,9 +693,9 @@ static void free_network(Network *net) {
             net->layers[i].type == LAYER_GEMM) {
             free_tensor(&net->layers[i].weights);
             vec_free(&net->layers[i].bias);
-            } else if (net->layers[i].type == LAYER_PRELU) {
-                vec_free(&net->layers[i].bias);
-            }
+        } else if (net->layers[i].type == LAYER_PRELU) {
+            vec_free(&net->layers[i].bias);
+        }
     }
     if (net->layers) {
         free(net->layers);
@@ -622,7 +704,8 @@ static void free_network(Network *net) {
     net->num_layers = 0;
 }
 
-static Tensor load_weights(const char *filepath, const uint32_t n, const uint32_t c, const uint32_t h, const uint32_t w) {
+static Tensor load_weights(const char *filepath, const uint32_t n, const uint32_t c, const uint32_t h,
+                           const uint32_t w) {
     const Tensor t = create_Tensor(n, c, h, w);
     FILE *f = fopen(filepath, "rb");
     if (!f) {
@@ -794,7 +877,6 @@ static Network load_network(const char *cfg_path, const char *weights_dir) {
 }
 
 static NetworkOutputs forward_network(const Network *net, const Tensor *input) {
-    //potential optimization but for yunet it is only 2KB so it is ok i think
     Tensor *outputs = malloc(net->num_layers * sizeof(Tensor));
     if (!outputs) {
         fprintf(stderr, "CRITICAL ERROR: Memory allocation failed for outputs array\n");
@@ -848,7 +930,7 @@ static NetworkOutputs forward_network(const Network *net, const Tensor *input) {
                 outputs[i] = flatten(in1);
                 break;
             case LAYER_GEMM:
-                outputs[i] = GEMM(in1, (Tensor*)&layer->weights, (Float_vector*)&layer->bias);
+                outputs[i] = GEMM(in1, (Tensor *) &layer->weights, (Float_vector *) &layer->bias);
                 break;
             case LAYER_SUB_SCALAR:
                 outputs[i] = sub_scalar(in1, layer->scalar_val);
@@ -942,7 +1024,7 @@ static void face_vec_free(FaceVector *v) {
     v->size = 0;
 }
 
-static const Tensor *find_output_tensor(const NetworkOutputs *outs, const char *name) {
+static Tensor *find_output_tensor(const NetworkOutputs *outs, const char *name) {
     for (size_t k = 0; k < outs->count; ++k) {
         if (strcmp(outs->outputs[k].name, name) == 0) {
             return &outs->outputs[k].tensor;
@@ -1029,8 +1111,8 @@ static void decode_yunet(const NetworkOutputs *outs, FaceVector *faces,
     }
 }
 
-// ============> NMS - leave only real faces with highest possibility <========
-//calculate how much lider's bounding box is in this b bounding box if more than threshold it is removed, if not it is other face
+// ============> NMS - leave only real faces with the highest possibility <========
+//calculate how much lider's bounding box is in this "b" bounding box if more than threshold it is removed, if not it is other face
 static float calculate_iou(const Face *a, const Face *b) {
     // get union area of 2 possible faces
     const float x1 = a->x > b->x ? a->x : b->x;
@@ -1376,9 +1458,12 @@ static float cosine_similarity(const float *a, const float *b, const size_t n) {
     }
     return dot;
 }
+
 static bool extract_face_feature(const Network *sface_net, const Tensor *aligned_face, float out_vec[128]) {
-    Tensor input_face = create_Tensor(aligned_face->batch, aligned_face->channel, aligned_face->height, aligned_face->width);
-    const size_t bytes = (size_t)aligned_face->batch * aligned_face->channel * aligned_face->height * aligned_face->width * sizeof(float);
+    Tensor input_face = create_Tensor(aligned_face->batch, aligned_face->channel, aligned_face->height,
+                                      aligned_face->width);
+    const size_t bytes = (size_t) aligned_face->batch * aligned_face->channel * aligned_face->height * aligned_face->
+                         width * sizeof(float);
     memcpy(input_face.data, aligned_face->data, bytes);
 
     NetworkOutputs sface_outs = forward_network(sface_net, &input_face);
@@ -1396,140 +1481,143 @@ static bool extract_face_feature(const Network *sface_net, const Tensor *aligned
     free_network_outputs(&sface_outs);
     return true;
 }
+
 // input picture -> network forward (yunet)-> decoding -> nms -> face alignment
 #define SFACE_COSINE_THRESHOLD 0.363f
 
-    int main() {
-        const int32_t total_cores = omp_get_num_procs();
-        const int32_t threads_available = total_cores > 1 ? total_cores - 1 : 1;
-        omp_set_num_threads(threads_available);
-        printf("[*] Wykryto%d rdzeni CPU. Uzywam %d watkow OpenMP .\n", total_cores, threads_available);
+int main() {
+    const int32_t total_cores = omp_get_num_procs();
+    const int32_t threads_available = total_cores > 1 ? total_cores - 1 : 1;
+    omp_set_num_threads(threads_available);
+    printf("[*] Wykryto%d rdzeni CPU. Uzywam %d watkow OpenMP .\n", total_cores, threads_available);
 
-        printf("[*] Ladowanie sieci YuNet (detektor)...\n");
-        Network yunet = load_network("models/yunet.cfg", "models/yunet_weights");
-        printf("[+] YuNet zaladowany! Liczba warstw: %zu\n", yunet.num_layers);
+    printf("[*] Ladowanie sieci YuNet (detektor)...\n");
+    Network yunet = load_network("models/yunet.cfg", "models/yunet_weights");
+    printf("[+] YuNet zaladowany! Liczba warstw: %zu\n", yunet.num_layers);
 
-        printf("[*] Ladowanie sieci SFace (rozpoznawanie)...\n");
-        Network sface = load_network("models/sface.cfg", "models/sface_weights");
-        printf("[+] SFace zaladowany! Liczba warstw: %zu\n", sface.num_layers);
-
-
-        const char *baseline_path = "../dataset/raw/roberto.jpg";
-        printf("\n[*] === REJESTRACJA WZORCA: %s ===\n", baseline_path);
-
-        int base_w = 0, base_h = 0, base_ch = 0;
-        unsigned char *base_raw = stbi_load(baseline_path, &base_w, &base_h, &base_ch, 3);
-        if (!base_raw) {
-            char fallback[512];
-            snprintf(fallback, sizeof(fallback), "../%s", baseline_path);
-            base_raw = stbi_load(fallback, &base_w, &base_h, &base_ch, 3);
-        }
-        if (!base_raw) {
-            fprintf(stderr, "[-] BLAD: Nie mozna otworzyc zdjecia referencyjnego '%s'!\n", baseline_path);
-            exit(1);
-        }
-
-        Tensor base_input = load_image_as_tensor(baseline_path, 640, 640);
-        NetworkOutputs base_outs = forward_network(&yunet, &base_input);
-
-        FaceVector base_faces;
-        face_vec_init(&base_faces, 16);
-        decode_yunet(&base_outs, &base_faces, 640, 640, 0.6f);
-        nms(&base_faces, 0.3f);
-
-        if (base_faces.size == 0) {
-            fprintf(stderr, "[-] BLAD: Nie wykryto zadnej twarzy na zdjeciu wzorcowym!\n");
-            exit(1);
-        }
-        printf("[+] Wykryto twarz wzorcowa! (Pewnosc detekcji: %.2f%%)\n", base_faces.faces[0].confidence * 100.0f);
-
-        const float base_scale_x = (float)base_w / 640.0f;
-        const float base_scale_y = (float)base_h / 640.0f;
-        float base_landmarks[10];
-        for (int k = 0; k < 5; ++k) {
-            base_landmarks[k * 2 + 0] = base_faces.faces[0].landmarks[k * 2 + 0] * base_scale_x;
-            base_landmarks[k * 2 + 1] = base_faces.faces[0].landmarks[k * 2 + 1] * base_scale_y;
-        }
-        Tensor aligned_base = align_crop_face(base_raw, base_w, base_h, base_landmarks);
-
-        float roberto_embedding[128];
-        if (!extract_face_feature(&sface, &aligned_base, roberto_embedding)) {
-            fprintf(stderr, "[-] BLAD: Ekstrakcja cech wzorca nie powiodla sie!\n");
-            exit(1);
-        }
-        printf("[+] Pomyslnie zarejestrowano embedding Roberto (128D, norma L2 = 1.0)!\n");
-
-        free_tensor(&aligned_base);
-        free_tensor(&base_input);
-        free_network_outputs(&base_outs);
-        face_vec_free(&base_faces);
-        stbi_image_free(base_raw);
+    printf("[*] Ladowanie sieci SFace (rozpoznawanie)...\n");
+    Network sface = load_network("models/sface.cfg", "models/sface_weights");
+    printf("[+] SFace zaladowany! Liczba warstw: %zu\n", sface.num_layers);
 
 
-        const char *test_path = "../dataset/raw/roberto3.jpg";
-        printf("\n[*] === TEST ROZPOZNAWANIA: %s ===\n", test_path);
+    const char *baseline_path = "../dataset/raw/roberto.jpg";
+    printf("\n[*] === REJESTRACJA WZORCA: %s ===\n", baseline_path);
 
-        int test_w = 0, test_h = 0, test_ch = 0;
-        unsigned char *test_raw = stbi_load(test_path, &test_w, &test_h, &test_ch, 3);
-        if (!test_raw) {
-            char fallback[512];
-            snprintf(fallback, sizeof(fallback), "../%s", test_path);
-            test_raw = stbi_load(fallback, &test_w, &test_h, &test_ch, 3);
-        }
-        if (!test_raw) {
-            fprintf(stderr, "[-] BLAD: Nie mozna otworzyc zdjecia testowego '%s'!\n", test_path);
-            exit(1);
-        }
-
-        Tensor test_input = load_image_as_tensor(test_path, 640, 640);
-        NetworkOutputs test_outs = forward_network(&yunet, &test_input);
-
-        FaceVector test_faces;
-        face_vec_init(&test_faces, 32);
-        decode_yunet(&test_outs, &test_faces, 640, 640, 0.6f);
-        nms(&test_faces, 0.3f);
-        printf("[+] Znaleziono twarzy na zdjeciu testowym: %zu\n", test_faces.size);
-
-        const float test_scale_x = (float)test_w / 640.0f;
-        const float test_scale_y = (float)test_h / 640.0f;
-
-        for (size_t i = 0; i < test_faces.size; ++i) {
-            const Face *f = &test_faces.faces[i];
-            float test_landmarks[10];
-            for (int k = 0; k < 5; ++k) {
-                test_landmarks[k * 2 + 0] = f->landmarks[k * 2 + 0] * test_scale_x;
-                test_landmarks[k * 2 + 1] = f->landmarks[k * 2 + 1] * test_scale_y;
-            }
-
-            Tensor aligned_test = align_crop_face(test_raw, test_w, test_h, test_landmarks);
-
-            float test_embedding[128];
-            extract_face_feature(&sface, &aligned_test, test_embedding);
-            free_tensor(&aligned_test);
-
-            const float similarity = cosine_similarity(roberto_embedding, test_embedding, 128);
-
-            printf("\n    -> Twarz [%zu]: bbox=[%.1f, %.1f, %.1f, %.1f], Detekcja: %.2f%%\n",
-                   i, f->x, f->y, f->w, f->h, f->confidence * 100.0f);
-
-            if (similarity >= SFACE_COSINE_THRESHOLD) {
-                printf("       [+] \033[1;32mSUKCES: Rozpoznano Roberto!\033[0m (Podobienstwo: %.2f%%, Score: %.4f >= %.3f)\n",
-                       similarity * 100.0f, similarity, SFACE_COSINE_THRESHOLD);
-            } else {
-                printf("       [-] \033[1;31mODRZUCONO: Nieznana osoba (Intruz)!\033[0m (Podobienstwo: %.2f%%, Score: %.4f < %.3f)\n",
-                       similarity * 100.0f, similarity, SFACE_COSINE_THRESHOLD);
-            }
-        }
-
-        draw_detections(test_path, &test_faces, "../dataset/raw/recognition_result.png");
-
-        stbi_image_free(test_raw);
-        face_vec_free(&test_faces);
-        free_tensor(&test_input);
-        free_network_outputs(&test_outs);
-        free_network(&yunet);
-        free_network(&sface);
-
-        printf("\n[+] Pamiec zwolniona prawidlowo. Program zakonczony sukcesem!\n");
-        return 0;
+    int base_w = 0, base_h = 0, base_ch = 0;
+    unsigned char *base_raw = stbi_load(baseline_path, &base_w, &base_h, &base_ch, 3);
+    if (!base_raw) {
+        char fallback[512];
+        snprintf(fallback, sizeof(fallback), "../%s", baseline_path);
+        base_raw = stbi_load(fallback, &base_w, &base_h, &base_ch, 3);
     }
+    if (!base_raw) {
+        fprintf(stderr, "[-] BLAD: Nie mozna otworzyc zdjecia referencyjnego '%s'!\n", baseline_path);
+        exit(1);
+    }
+
+    Tensor base_input = load_image_as_tensor(baseline_path, 640, 640);
+    NetworkOutputs base_outs = forward_network(&yunet, &base_input);
+
+    FaceVector base_faces;
+    face_vec_init(&base_faces, 16);
+    decode_yunet(&base_outs, &base_faces, 640, 640, 0.6f);
+    nms(&base_faces, 0.3f);
+
+    if (base_faces.size == 0) {
+        fprintf(stderr, "[-] BLAD: Nie wykryto zadnej twarzy na zdjeciu wzorcowym!\n");
+        exit(1);
+    }
+    printf("[+] Wykryto twarz wzorcowa! (Pewnosc detekcji: %.2f%%)\n", base_faces.faces[0].confidence * 100.0f);
+
+    const float base_scale_x = (float) base_w / 640.0f;
+    const float base_scale_y = (float) base_h / 640.0f;
+    float base_landmarks[10];
+    for (int k = 0; k < 5; ++k) {
+        base_landmarks[k * 2 + 0] = base_faces.faces[0].landmarks[k * 2 + 0] * base_scale_x;
+        base_landmarks[k * 2 + 1] = base_faces.faces[0].landmarks[k * 2 + 1] * base_scale_y;
+    }
+    Tensor aligned_base = align_crop_face(base_raw, base_w, base_h, base_landmarks);
+
+    float roberto_embedding[128];
+    if (!extract_face_feature(&sface, &aligned_base, roberto_embedding)) {
+        fprintf(stderr, "[-] BLAD: Ekstrakcja cech wzorca nie powiodla sie!\n");
+        exit(1);
+    }
+    printf("[+] Pomyslnie zarejestrowano embedding Roberto (128D, norma L2 = 1.0)!\n");
+
+    free_tensor(&aligned_base);
+    free_tensor(&base_input);
+    free_network_outputs(&base_outs);
+    face_vec_free(&base_faces);
+    stbi_image_free(base_raw);
+
+
+    const char *test_path = "../dataset/raw/roberto3.jpg";
+    printf("\n[*] === TEST ROZPOZNAWANIA: %s ===\n", test_path);
+
+    int test_w = 0, test_h = 0, test_ch = 0;
+    unsigned char *test_raw = stbi_load(test_path, &test_w, &test_h, &test_ch, 3);
+    if (!test_raw) {
+        char fallback[512];
+        snprintf(fallback, sizeof(fallback), "../%s", test_path);
+        test_raw = stbi_load(fallback, &test_w, &test_h, &test_ch, 3);
+    }
+    if (!test_raw) {
+        fprintf(stderr, "[-] BLAD: Nie mozna otworzyc zdjecia testowego '%s'!\n", test_path);
+        exit(1);
+    }
+
+    Tensor test_input = load_image_as_tensor(test_path, 640, 640);
+    NetworkOutputs test_outs = forward_network(&yunet, &test_input);
+
+    FaceVector test_faces;
+    face_vec_init(&test_faces, 32);
+    decode_yunet(&test_outs, &test_faces, 640, 640, 0.6f);
+    nms(&test_faces, 0.3f);
+    printf("[+] Znaleziono twarzy na zdjeciu testowym: %zu\n", test_faces.size);
+
+    const float test_scale_x = (float) test_w / 640.0f;
+    const float test_scale_y = (float) test_h / 640.0f;
+
+    for (size_t i = 0; i < test_faces.size; ++i) {
+        const Face *f = &test_faces.faces[i];
+        float test_landmarks[10];
+        for (int k = 0; k < 5; ++k) {
+            test_landmarks[k * 2 + 0] = f->landmarks[k * 2 + 0] * test_scale_x;
+            test_landmarks[k * 2 + 1] = f->landmarks[k * 2 + 1] * test_scale_y;
+        }
+
+        Tensor aligned_test = align_crop_face(test_raw, test_w, test_h, test_landmarks);
+
+        float test_embedding[128];
+        extract_face_feature(&sface, &aligned_test, test_embedding);
+        free_tensor(&aligned_test);
+
+        const float similarity = cosine_similarity(roberto_embedding, test_embedding, 128);
+
+        printf("\n    -> Twarz [%zu]: bbox=[%.1f, %.1f, %.1f, %.1f], Detekcja: %.2f%%\n",
+               i, f->x, f->y, f->w, f->h, f->confidence * 100.0f);
+
+        if (similarity >= SFACE_COSINE_THRESHOLD) {
+            printf(
+                "       [+] \033[1;32mSUKCES: Rozpoznano Roberto!\033[0m (Podobienstwo: %.2f%%, Score: %.4f >= %.3f)\n",
+                similarity * 100.0f, similarity, SFACE_COSINE_THRESHOLD);
+        } else {
+            printf(
+                "       [-] \033[1;31mODRZUCONO: Nieznana osoba (Intruz)!\033[0m (Podobienstwo: %.2f%%, Score: %.4f < %.3f)\n",
+                similarity * 100.0f, similarity, SFACE_COSINE_THRESHOLD);
+        }
+    }
+
+    draw_detections(test_path, &test_faces, "../dataset/raw/recognition_result.png");
+
+    stbi_image_free(test_raw);
+    face_vec_free(&test_faces);
+    free_tensor(&test_input);
+    free_network_outputs(&test_outs);
+    free_network(&yunet);
+    free_network(&sface);
+
+    printf("\n[+] Pamiec zwolniona prawidlowo. Program zakonczony sukcesem!\n");
+    return 0;
+}
