@@ -1,6 +1,7 @@
 venv/
 env/
 __pycache__/
+*.pyc
 
 models/*.onnx
 models/*.pt
@@ -12,3 +13,13 @@ dataset/
 *.jpg
 *.png
 *.npy
+
+build/
+bin/
+
+*.so
+*.dll
+*.dylib
+*.o
+real_version
+real_version.exe
