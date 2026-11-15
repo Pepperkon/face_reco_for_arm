@@ -88,6 +88,13 @@ gcc -O3 -mcpu=cortex-a72 -mfpu=neon-fp-armv8 -mfloat-abi=hard -fopenmp main.c -l
 ```
 Without `-O3` the NEON path is noticeably slower, and without `-fopenmp` the code runs single-threaded. On non-ARM targets (e.g. Windows) the portable `conv_1x1_x86` fallback is used.
 
+#### Testing the NEON path on x86 (mock)
+`tests/neon_mock.h` emulates the used NEON intrinsics with scalar code, so the NEON 1x1 conv can be checked against `conv_1x1_x86` on any machine (correctness only, not speed):
+```bash
+gcc -O2 -fopenmp -DNEON_MOCK -I. tests/test_conv1x1.c -lm -o test_conv1x1
+./test_conv1x1        # expected: 320/320 cases passed
+```
+
 #### Windows (PowerShell with MinGW / GCC)
 ```powershell
 # 1. Compile with OpenMP and Release optimizations

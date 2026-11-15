@@ -10,7 +10,11 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
-#if defined(__ARM_NEON) || defined(__aarch64__)
+#if defined(NEON_MOCK)
+    // scalar emulation of NEON intrinsics, lets us test the NEON code path on x86
+    #include "tests/neon_mock.h"
+    #define USE_NEON_OPTIMIZATION 1
+#elif defined(__ARM_NEON) || defined(__aarch64__)
     #include <arm_neon.h>
     #define USE_NEON_OPTIMIZATION 1
 #else
@@ -524,7 +528,7 @@ static Tensor conv_1x1_arm_neon(const Tensor *input, const Tensor *filter_tensor
             }
             //leftovers
             for (uint32_t j = 0; j < nof_channels; ++j) {
-                conv1x1_scalar(in_b, weights + (size_t) j * in_channels, in_channels, out_channel_size, input->width, out_w, stride,
+                conv1x1_scalar(in_b, weights + (size_t) j * in_channels, in_channels, input_channel_size, input->width, out_w, stride,
                                biases[j], apply_relu, out_block + j * out_channel_size, p, out_channel_size);
             }
 
