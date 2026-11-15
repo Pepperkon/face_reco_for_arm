@@ -467,8 +467,13 @@ void conv1x1_arm_neon_block(const float *input_b, const float *weights,const flo
             //get kernel
             const float w = weights[(size_t)i*channels_in+c];
             // acc[i] += input*weight
+#if defined(__aarch64__)
             acc[i][0] = vfmaq_n_f32(acc[i][0], x0, w);
             acc[i][1] = vfmaq_n_f32(acc[i][1], x1, w);
+#else
+            acc[i][0] = vmlaq_n_f32(acc[i][0], x0, w);
+            acc[i][1] = vmlaq_n_f32(acc[i][1], x1, w);
+#endif
         }
     }
     const float32x4_t zero = vdupq_n_f32(0.0f);
@@ -1567,7 +1572,7 @@ int main() {
     printf("[+] SFace zaladowany! Liczba warstw: %zu\n", sface.num_layers);
 
 
-        const char *baseline_path = "../dataset/raw/roberto.jpg";
+        const char *baseline_path = "dataset/raw/roberto.jpg";
         printf("\n[*] === REJESTRACJA WZORCA: %s ===\n", baseline_path);
 
     int base_w = 0, base_h = 0, base_ch = 0;
@@ -1619,7 +1624,7 @@ int main() {
     stbi_image_free(base_raw);
 
 
-        const char *test_path = "../dataset/raw/roberto3.jpg";
+        const char *test_path = "dataset/raw/roberto3.jpg";
         printf("\n[*] === TEST ROZPOZNAWANIA: %s ===\n", test_path);
 
     int test_w = 0, test_h = 0, test_ch = 0;
@@ -1676,7 +1681,7 @@ int main() {
         }
     }
 
-        draw_detections(test_path, &test_faces, "../dataset/raw/recognition_result.png");
+        draw_detections(test_path, &test_faces, "dataset/raw/recognition_result.png");
 
     stbi_image_free(test_raw);
     face_vec_free(&test_faces);
