@@ -13,10 +13,10 @@
 #if defined(__ARM_NEON) || defined(__aarch64__)
     #include <arm_neon.h>
     #define USE_NEON_OPTIMIZATION 1
-#elif defined(_M_X64) || defined(__x86_64__)
+#else
     #define USE_NEON_OPTIMIZATION 0
-
 #endif
+
 #include <stdbool.h>
 #ifndef nullptr
 #define nullptr NULL
@@ -97,6 +97,7 @@ static void vec_free(Float_vector *v) {
     v->size = 0;
     v->capacity = 0;
 }
+
 // ===================================
 
 // ============> TENSOR <=============
@@ -438,7 +439,49 @@ static Tensor conv_1x1_x86(const Tensor *input, const Tensor *filter_tensor, con
     }
     return out;
 }
+#if USE_NEON_OPTIMIZATION
+static void conv1x1_scalar(const float *in_b, const float *w, const uint32_t c_in, const size_t in_plane,
+                           const uint32_t in_w, const uint32_t out_w, const uint32_t stride,
+                           const float bias_val, const bool relu,
+                           float *out_plane, const size_t p_begin, const size_t p_end) {
+    for (size_t p = p_begin; p < p_end; ++p) {
+        const size_t src = (p / out_w) * stride * in_w + (p % out_w) * stride;
+        float sum = bias_val;
+        for (uint32_t ic = 0; ic < c_in; ++ic) sum += w[ic] * in_b[ic * in_plane + src];
+        out_plane[p] = relu && sum < 0.0f ? 0.0f : sum;
+    }
+}
+void conv1x1_arm_neon_block(const float *input_b, const float *weights,const float *biases,float* out_block, const bool apply_relu,
+    const uint32_t channels_in, const size_t channel_size, const size_t p) {
+   //saving 8 pixels on plane and 4 on channel parameterr (so 2 vectors on xy and 8vectors on xyz)
+    float32x4_t acc[4][2];
+    for (uint32_t i = 0; i < 4; ++i) {
+        //load biases (bias is per channel)
+        acc[i][0] = acc[i][1] =  vdupq_n_f32(biases[i]);
+    }
 
+    for (uint32_t c = 0; c < channels_in; ++c) {
+        const float32x4_t x0 = vld1q_f32(input_b + channel_size*c + p);
+        const float32x4_t x1 = vld1q_f32(input_b + channel_size*c + p + 4);
+        for (uint32_t i = 0; i < 4; ++i) {
+            //get kernel
+            const float w = weights[(size_t)i*channels_in+c];
+            // acc[i] += input*weight
+            acc[i][0] = vfmaq_n_f32(acc[i][0], x0, w);
+            acc[i][1] = vfmaq_n_f32(acc[i][1], x1, w);
+        }
+    }
+    const float32x4_t zero = vdupq_n_f32(0.0f);
+    for (int j = 0; j < 4; ++j) {
+        if (apply_relu) {
+            acc[j][0] = vmaxq_f32(acc[j][0], zero);
+            acc[j][1] = vmaxq_f32(acc[j][1], zero);
+        }
+        //save to tensor
+        vst1q_f32(out_block + j * channel_size + p, acc[j][0]);
+        vst1q_f32(out_block + j * channel_size + p + 4, acc[j][1]);
+    }
+}
 static Tensor conv_1x1_arm_neon(const Tensor *input, const Tensor *filter_tensor, const Float_vector *bias,
     const uint32_t stride, const bool apply_relu) {
     const uint32_t out_channels = filter_tensor->batch; // number of filters
@@ -455,24 +498,48 @@ static Tensor conv_1x1_arm_neon(const Tensor *input, const Tensor *filter_tensor
     const size_t input_channel_size = input->height * input->width;
     const uint32_t n_blocks = (out_channels+3)/4;
 
-    for (uint32_t b = 0; b < n_blocks; ++b) {
+    for (uint32_t b = 0; b < input->batch; ++b) {
         const float *in_b = input->data + b * in_channels * input_channel_size;
         float *out_b = out.data + b * out_channels * out_channel_size;
 #pragma omp parallel for schedule(static)
         for (uint32_t block = 0; block < n_blocks; ++block) {
+            //check if it has 4 channels or these are leftovers
+            const uint32_t nof_channels = out_channels - block*4 <4 ? out_channels - block*4 : 4;
+            float biases[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            for (uint32_t c = 0; c < nof_channels; ++c) {
+                biases[c]= bias != NULL && bias->size > c + block*4 ? bias->data[c + block*4] : 0.0f;
+            }
+            const float *weights = filter_tensor->data +  block*4 * in_channels;
+            float *out_block =out_b+ block*4 * out_channel_size;
+            uint32_t p = 0;
+            if (nof_channels == 4 && stride == 1) {
+                for (; p+8 <=out_channel_size; p+=8) {
+                    conv1x1_arm_neon_block(in_b,weights, biases,out_block,apply_relu,in_channels,out_channel_size,p);
+                }
+            }
+            //leftovers
+            for (uint32_t j = 0; j < nof_channels; ++j) {
+                conv1x1_scalar(in_b, weights + (size_t) j * in_channels, in_channels, out_channel_size, input->width, out_w, stride,
+                               biases[j], apply_relu, out_block + j * out_channel_size, p, out_channel_size);
+            }
 
         }
     }
+    return out;
 }
+#endif
     // classical conv
     // out size formula is same for height and width O= floor((I-K+2P)/S) + 1, where I is input size, K is kernel size,
     // p is padding and S is Stride
     // filter tensor params are [C_out, C_in, K_h, K_w] - c_out is number of channels on out tensor and C_in is channels _in
     static Tensor conv(const Tensor *input, const Tensor *filter_tensor, const Float_vector *bias, const uint32_t stride,
                        const uint32_t padding, bool apply_relu) {
-        if (filter_tensor->width == 1 && filter_tensor->height == 1) {
-            if (!USE_NEON_OPTIMIZATION) return conv_1x1_x86(input,filter_tensor,bias,stride,apply_relu);
+        if (filter_tensor->width == 1 && filter_tensor->height == 1 && padding == 0) {
+            #if USE_NEON_OPTIMIZATION
             return conv_1x1_arm_neon(input,filter_tensor,bias,stride,apply_relu);
+            #else
+            return conv_1x1_x86(input,filter_tensor,bias,stride,apply_relu);
+            #endif
         }
         //more clean names
         const uint32_t out_channels = filter_tensor->batch; // number of filters
@@ -1500,7 +1567,7 @@ int main() {
     printf("[+] SFace zaladowany! Liczba warstw: %zu\n", sface.num_layers);
 
 
-        const char *baseline_path = "dataset/raw/roberto.jpg";
+        const char *baseline_path = "../dataset/raw/roberto.jpg";
         printf("\n[*] === REJESTRACJA WZORCA: %s ===\n", baseline_path);
 
     int base_w = 0, base_h = 0, base_ch = 0;
@@ -1552,7 +1619,7 @@ int main() {
     stbi_image_free(base_raw);
 
 
-        const char *test_path = "dataset/raw/roberto3.jpg";
+        const char *test_path = "../dataset/raw/roberto3.jpg";
         printf("\n[*] === TEST ROZPOZNAWANIA: %s ===\n", test_path);
 
     int test_w = 0, test_h = 0, test_ch = 0;
@@ -1609,7 +1676,7 @@ int main() {
         }
     }
 
-        draw_detections(test_path, &test_faces, "dataset/raw/recognition_result.png");
+        draw_detections(test_path, &test_faces, "../dataset/raw/recognition_result.png");
 
     stbi_image_free(test_raw);
     face_vec_free(&test_faces);

@@ -74,6 +74,20 @@ gcc -O3 -fopenmp main.c -lm -o real_version
 ./real_version
 ```
 
+#### Raspberry Pi 4B (ARM NEON)
+The 1x1 convolution has a hand-written NEON path (`conv_1x1_arm_neon`), enabled automatically when `__ARM_NEON` / `__aarch64__` is defined. Check your OS architecture with `uname -m`.
+```bash
+# 64-bit OS (aarch64) - NEON is enabled by default
+gcc -O3 -mcpu=cortex-a72 -fopenmp main.c -lm -o real_version
+
+# 32-bit OS (armv7l) - NEON must be enabled explicitly
+# (also replace vfmaq_n_f32 with vmlaq_n_f32 in main.c, FMA intrinsics are aarch64-only)
+gcc -O3 -mcpu=cortex-a72 -mfpu=neon-fp-armv8 -mfloat-abi=hard -fopenmp main.c -lm -o real_version
+
+./real_version
+```
+Without `-O3` the NEON path is noticeably slower, and without `-fopenmp` the code runs single-threaded. On non-ARM targets (e.g. Windows) the portable `conv_1x1_x86` fallback is used.
+
 #### Windows (PowerShell with MinGW / GCC)
 ```powershell
 # 1. Compile with OpenMP and Release optimizations
